@@ -7,7 +7,7 @@ use ::window::glium::uniforms::{
     MagnifySamplerFilter, MinifySamplerFilter, Sampler, SamplerWrapFunction,
 };
 use ::window::glium::{BlendingFunction, LinearBlendingFactor, Surface};
-use config::FreeTypeLoadTarget;
+use config::{FreeTypeLoadTarget, WebGpuPresentMode};
 use std::time::Instant;
 
 impl crate::TermWindow {
@@ -159,6 +159,20 @@ impl crate::TermWindow {
         let present_duration = present_start.elapsed();
         metrics::histogram!("gui.frame.present_wait").record(present_duration);
         log::trace!("present took {:?}", present_duration);
+
+        // On Windows with Fifo mode, use DwmFlush to synchronize with the
+        // compositor's vsync. wgpu's Fifo mode doesn't always block properly
+        // on Windows because DWM handles composition.
+        #[cfg(windows)]
+        if self.config.webgpu_present_mode == WebGpuPresentMode::Fifo {
+            let dwm_start = Instant::now();
+            unsafe {
+                winapi::um::dwmapi::DwmFlush();
+            }
+            let dwm_duration = dwm_start.elapsed();
+            metrics::histogram!("gui.frame.dwm_flush").record(dwm_duration);
+            log::trace!("DwmFlush took {:?}", dwm_duration);
+        }
 
         Ok(())
     }
