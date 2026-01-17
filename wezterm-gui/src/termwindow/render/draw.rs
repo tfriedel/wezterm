@@ -290,17 +290,19 @@ impl crate::TermWindow {
                     log::trace!("DwmFlush took {:?}", dwm_duration);
                 }
                 WebGpuPresentMode::Mailbox | WebGpuPresentMode::AutoNoVsync => {
-                    // Mailbox/AutoNoVsync mode: no additional pacing needed.
+                    // Mailbox mode: sleep after present to limit frame rate and save CPU.
                     //
-                    // Previous attempts at frame pacing caused jitter because Windows
-                    // sleep timing isn't precise enough. The high CPU usage in pure
-                    // Mailbox comes from the main event loop, not from rendering.
+                    // This doesn't add input latency because:
+                    // - Input arrives → paint happens immediately (no throttle)
+                    // - Present completes → we sleep here
+                    // - Next frame starts after sleep expires
                     //
-                    // For now, let the render run at full speed. The frame limiter
-                    // should be implemented at the event loop level, not here.
-                    //
-                    // TODO: Investigate event loop pacing or use waitable timer objects
-                    // for more precise timing.
+                    // Fixed 6ms sleep balances CPU savings vs frame rate:
+                    // - With ~2ms render time, cycle is ~8ms = ~125fps max
+                    // - DWM picks up frames at vsync rate (60/120/144Hz)
+                    // - Extra frames are discarded, but CPU is much lower than no sleep
+                    dwm_vsync::ensure_timer_resolution();
+                    std::thread::sleep(Duration::from_millis(6));
                 }
                 WebGpuPresentMode::Immediate => {
                     // Immediate mode: no pacing, lowest latency but highest CPU

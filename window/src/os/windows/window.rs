@@ -1612,11 +1612,13 @@ unsafe fn wm_paint(hwnd: HWND, _msg: UINT, _wparam: WPARAM, _lparam: LPARAM) -> 
     let inner = rc_from_hwnd(hwnd)?;
     let mut inner = inner.borrow_mut();
 
-    // In Fifo (vsync) mode, let the GPU's vsync blocking handle frame pacing
-    // instead of using a timer-based throttle. This ensures frames align with
-    // vsync boundaries for smooth scrolling.
-    // See: SCROLL_SMOOTHNESS_FINDINGS.md
-    let use_timer_throttle = inner.config.webgpu_present_mode != WebGpuPresentMode::Fifo;
+    // For Fifo and Mailbox modes, bypass the timer-based throttle to minimize
+    // input latency. Frame pacing is handled differently for each:
+    // - Fifo: DwmFlush() after present blocks until frame is displayed
+    // - Mailbox: GPU/DWM naturally pace to vsync, we just need to not over-throttle
+    //
+    // Only use timer throttle for Immediate mode where we need explicit rate limiting.
+    let use_timer_throttle = inner.config.webgpu_present_mode == WebGpuPresentMode::Immediate;
 
     if use_timer_throttle && inner.paint_throttled {
         inner.invalidated = true;
@@ -1644,8 +1646,8 @@ unsafe fn wm_paint(hwnd: HWND, _msg: UINT, _wparam: WPARAM, _lparam: LPARAM) -> 
     // Ask the app to repaint in a bit
     inner.events.dispatch(WindowEvent::NeedRepaint);
 
-    // Only use timer-based throttle for non-Fifo modes
-    // In Fifo mode, vsync will naturally pace the frames
+    // Only use timer-based throttle for Immediate mode
+    // Fifo and Mailbox handle pacing through GPU/DWM vsync
     if use_timer_throttle {
         inner.paint_throttled = true;
         let window_id = inner.hwnd;
