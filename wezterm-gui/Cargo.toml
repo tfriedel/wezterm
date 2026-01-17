@@ -119,6 +119,7 @@ winapi = { workspace=true, features = [
     "winsock2",
     "dwmapi",
     "profileapi",
+    "timeapi",
 ]}
 windows = { workspace=true, features = [
     "Win32_UI_Shell",

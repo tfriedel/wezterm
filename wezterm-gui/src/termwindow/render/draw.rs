@@ -13,7 +13,25 @@ use std::time::{Duration, Instant};
 /// Vsync timing utilities for Windows DWM compositor
 #[cfg(windows)]
 mod dwm_vsync {
-    use std::time::Duration;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// Track whether we've set the timer resolution
+    static TIMER_RESOLUTION_SET: AtomicBool = AtomicBool::new(false);
+
+    /// Set Windows timer resolution to 1ms for precise sleeping.
+    /// This is a system-wide setting but ref-counted by Windows.
+    /// Should be called once at startup.
+    pub fn ensure_timer_resolution() {
+        if !TIMER_RESOLUTION_SET.swap(true, Ordering::SeqCst) {
+            unsafe {
+                // Request 1ms timer resolution
+                // This improves sleep() precision from ~15.6ms to ~1ms
+                winapi::um::timeapi::timeBeginPeriod(1);
+            }
+            log::debug!("Set Windows timer resolution to 1ms for frame pacing");
+        }
+    }
 
     /// Get the time until the next vsync boundary using DWM timing info.
     /// Returns None if timing info couldn't be retrieved.
@@ -86,20 +104,13 @@ mod dwm_vsync {
         }
     }
 
-    /// Wait until just before the next vsync, leaving a small margin for processing.
-    /// Returns the actual wait duration, or None if we couldn't get timing info.
-    pub fn wait_for_vsync_aligned_present(margin: Duration) -> Option<Duration> {
-        let time_until_vsync = time_until_next_vsync()?;
-
-        if time_until_vsync <= margin {
-            // Already close enough, present now
-            return Some(Duration::ZERO);
+    /// Sleep with 1ms timer resolution (no spin-wait to avoid CPU burn).
+    /// With timeBeginPeriod(1), Windows sleep is accurate to ~1-2ms.
+    pub fn precise_sleep(duration: Duration) {
+        if duration.is_zero() {
+            return;
         }
-
-        let wait_time = time_until_vsync - margin;
-        std::thread::sleep(wait_time);
-
-        Some(wait_time)
+        std::thread::sleep(duration);
     }
 }
 
@@ -252,19 +263,49 @@ impl crate::TermWindow {
         metrics::histogram!("gui.frame.present_wait").record(present_duration);
         log::trace!("present took {:?}", present_duration);
 
-        // On Windows with Fifo mode, use DwmFlush to synchronize with the
-        // compositor's vsync. wgpu's Fifo mode doesn't always block properly
-        // on Windows because DWM handles composition.
-        // Note: This adds ~1 frame of latency but ensures smooth frame pacing.
+        // Frame pacing for Windows to reduce CPU usage while maintaining low latency.
+        //
+        // The key insight is WHERE we sleep matters for latency:
+        // - DwmFlush() waits for the CURRENT frame to be displayed → adds latency
+        // - Sleeping here delays starting the NEXT frame → doesn't add latency
+        //
+        // In Mailbox mode without pacing, we render as fast as possible (~1500 fps),
+        // wasting CPU because DWM only picks up one frame per vsync anyway.
+        //
+        // With pacing: after present(), we calculate time until next vsync and sleep
+        // for most of that time, leaving a margin to start rendering the next frame
+        // so it's ready just in time for the following vsync.
         #[cfg(windows)]
-        if self.config.webgpu_present_mode == WebGpuPresentMode::Fifo {
-            let dwm_start = Instant::now();
-            unsafe {
-                winapi::um::dwmapi::DwmFlush();
+        {
+            match self.config.webgpu_present_mode {
+                WebGpuPresentMode::Fifo => {
+                    // Fifo mode: use DwmFlush for guaranteed vsync sync
+                    // This adds ~1 frame of latency but ensures perfect frame pacing
+                    let dwm_start = Instant::now();
+                    unsafe {
+                        winapi::um::dwmapi::DwmFlush();
+                    }
+                    let dwm_duration = dwm_start.elapsed();
+                    metrics::histogram!("gui.frame.dwm_flush").record(dwm_duration);
+                    log::trace!("DwmFlush took {:?}", dwm_duration);
+                }
+                WebGpuPresentMode::Mailbox | WebGpuPresentMode::AutoNoVsync => {
+                    // Mailbox/AutoNoVsync mode: no additional pacing needed.
+                    //
+                    // Previous attempts at frame pacing caused jitter because Windows
+                    // sleep timing isn't precise enough. The high CPU usage in pure
+                    // Mailbox comes from the main event loop, not from rendering.
+                    //
+                    // For now, let the render run at full speed. The frame limiter
+                    // should be implemented at the event loop level, not here.
+                    //
+                    // TODO: Investigate event loop pacing or use waitable timer objects
+                    // for more precise timing.
+                }
+                WebGpuPresentMode::Immediate => {
+                    // Immediate mode: no pacing, lowest latency but highest CPU
+                }
             }
-            let dwm_duration = dwm_start.elapsed();
-            metrics::histogram!("gui.frame.dwm_flush").record(dwm_duration);
-            log::trace!("DwmFlush took {:?}", dwm_duration);
         }
 
         Ok(())

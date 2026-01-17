@@ -47,7 +47,7 @@ $scrollCommand = "powershell -NoProfile -Command `"1..50000 | ForEach-Object { W
 
 # Terminal configurations
 # Set $EnabledTerminals to control which terminals to test
-$EnabledTerminals = @("WezTerm", "Alacritty", "WindowsTerminalDev")  # Options: "WezTerm", "WindowsTerminal", "WindowsTerminalDev", "Alacritty"
+$EnabledTerminals = @("WezTerm")  # Options: "WezTerm", "WindowsTerminal", "WindowsTerminalDev", "Alacritty"
 
 $scrollScript = "S:\projects\wezterm\benchmark_scroll.cmd"
 
@@ -126,14 +126,18 @@ foreach ($terminal in $terminals) {
     $terminalProcId = $newProcIds | Select-Object -First 1
     Write-Host "  Tracking process ID: $terminalProcId" -ForegroundColor Gray
 
-    # Position window to left half of screen
+    # Position window to left half of screen (optional, errors are non-fatal)
     $termProc = Get-Process -Id $terminalProcId -ErrorAction SilentlyContinue
     if ($termProc -and $termProc.MainWindowHandle -ne [IntPtr]::Zero) {
-        $hwnd = $termProc.MainWindowHandle
-        $moveWindowSig = '[DllImport("user32.dll")] public static extern bool MoveWindow(IntPtr hWnd, int X, int Y, int nWidth, int nHeight, bool bRepaint);'
-        $moveWindow = Add-Type -MemberDefinition $moveWindowSig -Name "WinAPI_$([guid]::NewGuid().ToString('N'))" -Namespace Win32 -PassThru
-        $moveWindow::MoveWindow($hwnd, $winX, $winY, $winWidth, $winHeight, $true) | Out-Null
-        Write-Host "  Window positioned to left half of screen" -ForegroundColor Gray
+        try {
+            $hwnd = $termProc.MainWindowHandle
+            $moveWindowSig = '[DllImport("user32.dll")] public static extern bool MoveWindow(IntPtr hWnd, int X, int Y, int nWidth, int nHeight, bool bRepaint);'
+            $moveWindow = Add-Type -MemberDefinition $moveWindowSig -Name "WinAPI_$([guid]::NewGuid().ToString('N'))" -Namespace Win32 -PassThru -ErrorAction Stop
+            $moveWindow::MoveWindow($hwnd, $winX, $winY, $winWidth, $winHeight, $true) | Out-Null
+            Write-Host "  Window positioned to left half of screen" -ForegroundColor Gray
+        } catch {
+            Write-Host "  (Window positioning skipped - not critical)" -ForegroundColor DarkGray
+        }
     }
 
     # Warmup period - let terminal and scrolling stabilize
