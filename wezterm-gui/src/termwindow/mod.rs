@@ -5,9 +5,9 @@ use crate::colorease::ColorEase;
 use crate::frontend::{front_end, try_front_end};
 use crate::inputmap::InputMap;
 use crate::overlay::{
+    CopyModeParams, CopyOverlay, LauncherArgs, LauncherFlags, QuickSelectOverlay,
     confirm_close_pane, confirm_close_tab, confirm_close_window, confirm_quit_program, launcher,
-    start_overlay, start_overlay_pane, CopyModeParams, CopyOverlay, LauncherArgs, LauncherFlags,
-    QuickSelectOverlay,
+    start_overlay, start_overlay_pane,
 };
 use crate::resize_increment_calculator::ResizeIncrementCalculator;
 use crate::scripting::guiwin::GuiWin;
@@ -16,11 +16,11 @@ use crate::selection::Selection;
 use crate::shapecache::*;
 use crate::tabbar::{TabBarItem, TabBarState};
 use crate::termwindow::background::{
-    load_background_image, reload_background_image, LoadedBackgroundLayer,
+    LoadedBackgroundLayer, load_background_image, reload_background_image,
 };
 use crate::termwindow::keyevent::{KeyTableArgs, KeyTableState};
 use crate::termwindow::modal::Modal;
-use crate::termwindow::render::paint::AllowImage;
+use crate::termwindow::render::paint::{AllowImage, FrameTimingTracker};
 use crate::termwindow::render::{
     CachedLineState, LineQuadCacheKey, LineQuadCacheValue, LineToEleShapeCacheKey,
     LineToElementShapeItem,
@@ -28,15 +28,15 @@ use crate::termwindow::render::{
 use crate::termwindow::webgpu::WebGpuState;
 use ::wezterm_term::input::{ClickPosition, MouseButton as TMB};
 use ::window::*;
-use anyhow::{anyhow, ensure, Context};
+use anyhow::{Context, anyhow, ensure};
 use config::keyassignment::{
     Confirmation, KeyAssignment, LauncherActionArgs, PaneDirection, Pattern, PromptInputLine,
     QuickSelectArguments, RotationDirection, SpawnCommand, SplitSize,
 };
 use config::window::WindowLevel;
 use config::{
-    configuration, AudibleBell, ConfigHandle, Dimension, DimensionContext, FrontEndSelection,
-    GeometryOrigin, GuiPosition, TermConfig, WindowCloseConfirmation,
+    AudibleBell, ConfigHandle, Dimension, DimensionContext, FrontEndSelection, GeometryOrigin,
+    GuiPosition, TermConfig, WindowCloseConfirmation, configuration,
 };
 use lfucache::*;
 use mlua::{FromLua, LuaSerdeExt, UserData, UserDataFields};
@@ -51,8 +51,8 @@ use mux::tab::{
 use mux::window::WindowId as MuxWindowId;
 use mux::{Mux, MuxNotification};
 use mux_lua::MuxPane;
-use smol::channel::Sender;
 use smol::Timer;
+use smol::channel::Sender;
 use std::cell::{RefCell, RefMut};
 use std::collections::{HashMap, LinkedList};
 use std::ops::Add;
@@ -457,6 +457,7 @@ pub struct TermWindow {
     last_fps_check_time: Instant,
     num_frames: usize,
     pub fps: f32,
+    frame_timing_tracker: FrameTimingTracker,
 
     connection_name: String,
 
@@ -684,6 +685,7 @@ impl TermWindow {
             num_frames: 0,
             last_frame_duration: Duration::ZERO,
             fps: 0.,
+            frame_timing_tracker: FrameTimingTracker::new(),
             config_subscription: None,
             os_parameters: None,
             gl: None,

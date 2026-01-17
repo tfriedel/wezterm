@@ -9,7 +9,7 @@ use crate::{
 };
 use anyhow::{bail, Context};
 use async_trait::async_trait;
-use config::{ConfigHandle, ImePreeditRendering, SystemBackdrop};
+use config::{ConfigHandle, ImePreeditRendering, SystemBackdrop, WebGpuPresentMode};
 use lazy_static::lazy_static;
 use promise::Future;
 use raw_window_handle::{
@@ -1612,7 +1612,13 @@ unsafe fn wm_paint(hwnd: HWND, _msg: UINT, _wparam: WPARAM, _lparam: LPARAM) -> 
     let inner = rc_from_hwnd(hwnd)?;
     let mut inner = inner.borrow_mut();
 
-    if inner.paint_throttled {
+    // In Fifo (vsync) mode, let the GPU's vsync blocking handle frame pacing
+    // instead of using a timer-based throttle. This ensures frames align with
+    // vsync boundaries for smooth scrolling.
+    // See: SCROLL_SMOOTHNESS_FINDINGS.md
+    let use_timer_throttle = inner.config.webgpu_present_mode != WebGpuPresentMode::Fifo;
+
+    if use_timer_throttle && inner.paint_throttled {
         inner.invalidated = true;
         return Some(0);
     }
@@ -1638,20 +1644,24 @@ unsafe fn wm_paint(hwnd: HWND, _msg: UINT, _wparam: WPARAM, _lparam: LPARAM) -> 
     // Ask the app to repaint in a bit
     inner.events.dispatch(WindowEvent::NeedRepaint);
 
-    inner.paint_throttled = true;
-    let window_id = inner.hwnd;
-    let max_fps = inner.config.max_fps;
-    promise::spawn::spawn(async move {
-        async_io::Timer::after(std::time::Duration::from_millis(1000 / max_fps as u64)).await;
-        Connection::with_window_inner(window_id, move |inner| {
-            inner.paint_throttled = false;
-            if inner.invalidated {
-                InvalidateRect(inner.hwnd.0, null(), 0);
-            }
-            Ok(())
-        });
-    })
-    .detach();
+    // Only use timer-based throttle for non-Fifo modes
+    // In Fifo mode, vsync will naturally pace the frames
+    if use_timer_throttle {
+        inner.paint_throttled = true;
+        let window_id = inner.hwnd;
+        let max_fps = inner.config.max_fps;
+        promise::spawn::spawn(async move {
+            async_io::Timer::after(std::time::Duration::from_millis(1000 / max_fps as u64)).await;
+            Connection::with_window_inner(window_id, move |inner| {
+                inner.paint_throttled = false;
+                if inner.invalidated {
+                    InvalidateRect(inner.hwnd.0, null(), 0);
+                }
+                Ok(())
+            });
+        })
+        .detach();
+    }
 
     Some(0)
 }

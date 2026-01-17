@@ -1,6 +1,6 @@
 use crate::termwindow::{RenderFrame, TermWindowNotif};
-use ::window::bitmaps::atlas::OutOfTextureSpace;
 use ::window::WindowOps;
+use ::window::bitmaps::atlas::OutOfTextureSpace;
 use anyhow::Context;
 use smol::Timer;
 use std::time::{Duration, Instant};
@@ -11,6 +11,55 @@ pub enum AllowImage {
     Yes,
     Scale(usize),
     No,
+}
+
+/// Tracks frame timing for smoothness diagnostics.
+/// Records inter-frame intervals and jitter to help diagnose stuttering.
+#[derive(Debug)]
+pub struct FrameTimingTracker {
+    /// When the last frame was presented
+    last_present_time: Option<Instant>,
+}
+
+impl Default for FrameTimingTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FrameTimingTracker {
+    pub fn new() -> Self {
+        Self {
+            last_present_time: None,
+        }
+    }
+
+    /// Record a frame presentation and emit timing metrics.
+    /// Call this after each frame is presented to track inter-frame intervals.
+    pub fn record_frame(&mut self, target_fps: u32) {
+        let now = Instant::now();
+
+        if let Some(last) = self.last_present_time {
+            let interval = now.duration_since(last);
+
+            // Record the actual inter-frame interval
+            metrics::histogram!("gui.frame.interval").record(interval);
+
+            // Calculate jitter: deviation from the target frame interval
+            let target_interval = Duration::from_secs_f64(1.0 / target_fps as f64);
+            let jitter_secs = (interval.as_secs_f64() - target_interval.as_secs_f64()).abs();
+            metrics::histogram!("gui.frame.interval.jitter").record(jitter_secs);
+
+            log::trace!(
+                "frame interval={:?} target={:?} jitter={:.3}ms",
+                interval,
+                target_interval,
+                jitter_secs * 1000.0
+            );
+        }
+
+        self.last_present_time = Some(now);
+    }
 }
 
 impl crate::TermWindow {
@@ -107,6 +156,11 @@ impl crate::TermWindow {
 
         self.call_draw(frame).ok();
         self.last_frame_duration = start.elapsed();
+
+        // Record frame timing for smoothness diagnostics
+        self.frame_timing_tracker
+            .record_frame(self.config.max_fps as u32);
+
         log::debug!(
             "paint_impl elapsed={:?}, fps={}",
             self.last_frame_duration,

@@ -1,6 +1,6 @@
 use crate::colorease::ColorEaseUniform;
-use crate::termwindow::webgpu::ShaderUniform;
 use crate::termwindow::RenderFrame;
+use crate::termwindow::webgpu::ShaderUniform;
 use crate::uniforms::UniformBuilder;
 use ::window::glium;
 use ::window::glium::uniforms::{
@@ -8,6 +8,7 @@ use ::window::glium::uniforms::{
 };
 use ::window::glium::{BlendingFunction, LinearBlendingFactor, Surface};
 use config::FreeTypeLoadTarget;
+use std::time::Instant;
 
 impl crate::TermWindow {
     pub fn call_draw(&mut self, frame: &mut RenderFrame) -> anyhow::Result<()> {
@@ -23,7 +24,13 @@ impl crate::TermWindow {
         let webgpu = self.webgpu.as_mut().unwrap();
         let render_state = self.render_state.as_ref().unwrap();
 
+        // Measure time to acquire the swapchain texture
+        // This can block waiting for vsync in Fifo mode
+        let acquire_start = Instant::now();
         let output = webgpu.surface.get_current_texture()?;
+        let acquire_duration = acquire_start.elapsed();
+        metrics::histogram!("gui.frame.acquire_texture").record(acquire_duration);
+        log::trace!("acquire_texture took {:?}", acquire_duration);
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -144,7 +151,14 @@ impl crate::TermWindow {
 
         // submit will accept anything that implements IntoIter
         webgpu.queue.submit(std::iter::once(encoder.finish()));
+
+        // Measure time spent in present()
+        // In Fifo mode this may block waiting for vsync
+        let present_start = Instant::now();
         output.present();
+        let present_duration = present_start.elapsed();
+        metrics::histogram!("gui.frame.present_wait").record(present_duration);
+        log::trace!("present took {:?}", present_duration);
 
         Ok(())
     }
