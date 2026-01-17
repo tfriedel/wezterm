@@ -8,7 +8,100 @@ use ::window::glium::uniforms::{
 };
 use ::window::glium::{BlendingFunction, LinearBlendingFactor, Surface};
 use config::{FreeTypeLoadTarget, WebGpuPresentMode};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// Vsync timing utilities for Windows DWM compositor
+#[cfg(windows)]
+mod dwm_vsync {
+    use std::time::Duration;
+
+    /// Get the time until the next vsync boundary using DWM timing info.
+    /// Returns None if timing info couldn't be retrieved.
+    ///
+    /// This uses DwmGetCompositionTimingInfo to get:
+    /// - qpcVBlank: the QPC timestamp of the last vsync
+    /// - qpcRefreshPeriod: the refresh period in QPC ticks
+    ///
+    /// We calculate when the next vsync will occur and return the duration to wait.
+    pub fn time_until_next_vsync() -> Option<Duration> {
+        use std::mem::MaybeUninit;
+        use winapi::shared::minwindef::FALSE;
+        use winapi::um::dwmapi::{DwmGetCompositionTimingInfo, DWM_TIMING_INFO};
+        use winapi::um::profileapi::{QueryPerformanceCounter, QueryPerformanceFrequency};
+
+        unsafe {
+            // Get QPC frequency for converting QPC ticks to time
+            let mut frequency: i64 = 0;
+            if QueryPerformanceFrequency(&mut frequency as *mut i64 as *mut _) == FALSE {
+                return None;
+            }
+
+            // Get current QPC time
+            let mut current_qpc: i64 = 0;
+            if QueryPerformanceCounter(&mut current_qpc as *mut i64 as *mut _) == FALSE {
+                return None;
+            }
+
+            // Get DWM timing info
+            // Note: hwnd must be NULL on Windows 8.1+
+            let mut timing_info = MaybeUninit::<DWM_TIMING_INFO>::zeroed();
+            let timing_ptr = timing_info.as_mut_ptr();
+            (*timing_ptr).cbSize = std::mem::size_of::<DWM_TIMING_INFO>() as u32;
+
+            let result = DwmGetCompositionTimingInfo(std::ptr::null_mut(), timing_ptr);
+            if result != 0 {
+                // HRESULT failure
+                return None;
+            }
+
+            let timing_info = timing_info.assume_init();
+            let qpc_vblank = timing_info.qpcVBlank as i64;
+            let qpc_refresh_period = timing_info.qpcRefreshPeriod as i64;
+
+            if qpc_refresh_period <= 0 {
+                return None;
+            }
+
+            // Calculate time since last vsync
+            let time_since_vblank = current_qpc - qpc_vblank;
+
+            // Calculate how many periods have elapsed since the recorded vblank
+            let periods_elapsed = time_since_vblank / qpc_refresh_period;
+
+            // Calculate the next vsync time
+            let next_vsync = qpc_vblank + (periods_elapsed + 1) * qpc_refresh_period;
+
+            // Time until next vsync in QPC ticks
+            let ticks_until_vsync = next_vsync - current_qpc;
+
+            if ticks_until_vsync <= 0 {
+                // Already past, present immediately
+                return Some(Duration::ZERO);
+            }
+
+            // Convert QPC ticks to Duration
+            // Duration = ticks * (1 second / frequency)
+            let nanos = (ticks_until_vsync as u128 * 1_000_000_000) / frequency as u128;
+            Some(Duration::from_nanos(nanos as u64))
+        }
+    }
+
+    /// Wait until just before the next vsync, leaving a small margin for processing.
+    /// Returns the actual wait duration, or None if we couldn't get timing info.
+    pub fn wait_for_vsync_aligned_present(margin: Duration) -> Option<Duration> {
+        let time_until_vsync = time_until_next_vsync()?;
+
+        if time_until_vsync <= margin {
+            // Already close enough, present now
+            return Some(Duration::ZERO);
+        }
+
+        let wait_time = time_until_vsync - margin;
+        std::thread::sleep(wait_time);
+
+        Some(wait_time)
+    }
+}
 
 impl crate::TermWindow {
     pub fn call_draw(&mut self, frame: &mut RenderFrame) -> anyhow::Result<()> {
@@ -153,7 +246,6 @@ impl crate::TermWindow {
         webgpu.queue.submit(std::iter::once(encoder.finish()));
 
         // Measure time spent in present()
-        // In Fifo mode this may block waiting for vsync
         let present_start = Instant::now();
         output.present();
         let present_duration = present_start.elapsed();
@@ -163,6 +255,7 @@ impl crate::TermWindow {
         // On Windows with Fifo mode, use DwmFlush to synchronize with the
         // compositor's vsync. wgpu's Fifo mode doesn't always block properly
         // on Windows because DWM handles composition.
+        // Note: This adds ~1 frame of latency but ensures smooth frame pacing.
         #[cfg(windows)]
         if self.config.webgpu_present_mode == WebGpuPresentMode::Fifo {
             let dwm_start = Instant::now();
