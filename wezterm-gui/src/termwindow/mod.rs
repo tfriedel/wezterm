@@ -21,7 +21,6 @@ use crate::termwindow::background::{
 use crate::termwindow::keyevent::{KeyTableArgs, KeyTableState};
 use crate::termwindow::modal::Modal;
 #[cfg(windows)]
-use crate::termwindow::render::draw::FramePacer;
 use crate::termwindow::render::paint::{AllowImage, FrameTimingTracker};
 use crate::termwindow::render::{
     CachedLineState, LineQuadCacheKey, LineQuadCacheValue, LineToEleShapeCacheKey,
@@ -460,8 +459,6 @@ pub struct TermWindow {
     num_frames: usize,
     pub fps: f32,
     frame_timing_tracker: FrameTimingTracker,
-    #[cfg(windows)]
-    frame_pacer: FramePacer,
 
     connection_name: String,
 
@@ -690,8 +687,6 @@ impl TermWindow {
             last_frame_duration: Duration::ZERO,
             fps: 0.,
             frame_timing_tracker: FrameTimingTracker::new(),
-            #[cfg(windows)]
-            frame_pacer: FramePacer::new(),
             config_subscription: None,
             os_parameters: None,
             gl: None,
