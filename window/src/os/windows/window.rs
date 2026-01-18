@@ -126,7 +126,6 @@ pub(crate) struct WindowInner {
 
     config: ConfigHandle,
     invalidated: bool,
-    force_immediate_paint: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Ord, PartialOrd)]
@@ -546,7 +545,6 @@ impl Window {
             maximize_button_position: None,
             config: config.clone(),
             invalidated: true,
-            force_immediate_paint: false,
         }));
 
         // Careful: `raw` owns a ref to inner, but there is no Drop impl
@@ -614,10 +612,6 @@ fn schedule_show_window(hwnd: HWindow, show: ShowWindowCommand) {
 }
 
 impl WindowInner {
-    fn request_immediate_paint(&mut self) {
-        self.force_immediate_paint = true;
-    }
-
     fn close(&mut self) {
         let hwnd = self.hwnd;
         promise::spawn::spawn(async move {
@@ -1575,7 +1569,6 @@ unsafe fn wm_size(hwnd: HWND, _msg: UINT, _wparam: WPARAM, _lparam: LPARAM) -> O
 
     if let Some(inner) = rc_from_hwnd(hwnd) {
         let mut inner = inner.borrow_mut();
-        inner.request_immediate_paint();
         should_paint = inner.check_and_call_resize_if_needed();
         should_pump = inner.in_size_move;
     }
@@ -1638,7 +1631,6 @@ unsafe fn wm_paint(hwnd: HWND, _msg: UINT, _wparam: WPARAM, _lparam: LPARAM) -> 
     EndPaint(hwnd, &mut ps);
 
     inner.invalidated = false;
-    inner.force_immediate_paint = false;
     // Ask the app to repaint in a bit
     inner.events.dispatch(WindowEvent::NeedRepaint);
 
@@ -1749,7 +1741,6 @@ unsafe fn mouse_button(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) ->
     };
     {
         let mut inner = inner.borrow_mut();
-        inner.request_immediate_paint();
         inner.events.dispatch(WindowEvent::MouseEvent(event));
     }
     Some(0)
@@ -1800,7 +1791,6 @@ unsafe fn nc_mouse_button(
     };
     {
         let mut inner = inner.borrow_mut();
-        inner.request_immediate_paint();
         inner.events.dispatch(WindowEvent::MouseEvent(event));
     }
     Some(0)
@@ -1833,7 +1823,6 @@ unsafe fn mouse_move(hwnd: HWND, _msg: UINT, wparam: WPARAM, lparam: LPARAM) -> 
         modifiers,
     };
 
-    inner.request_immediate_paint();
     inner.events.dispatch(WindowEvent::MouseEvent(event));
     Some(0)
 }
@@ -1870,7 +1859,6 @@ unsafe fn nc_mouse_move(hwnd: HWND, _msg: UINT, wparam: WPARAM, lparam: LPARAM) 
         modifiers,
     };
 
-    inner.request_immediate_paint();
     inner.events.dispatch(WindowEvent::MouseEvent(event));
     inner.events.dispatch(WindowEvent::NeedRepaint);
 
@@ -1960,7 +1948,6 @@ unsafe fn mouse_wheel(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) -> 
         mouse_buttons,
         modifiers,
     };
-    inner.request_immediate_paint();
     inner.events.dispatch(WindowEvent::MouseEvent(event));
     Some(0)
 }
@@ -2471,7 +2458,6 @@ unsafe fn translate_message(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARA
 unsafe fn key(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
     let inner = rc_from_hwnd(hwnd)?;
     let mut inner = inner.borrow_mut();
-    inner.request_immediate_paint();
     let repeat = (lparam & 0xffff) as u16;
     let scan_code = ((lparam >> 16) & 0xff) as u8;
     let releasing = (lparam & (1 << 31)) != 0;
