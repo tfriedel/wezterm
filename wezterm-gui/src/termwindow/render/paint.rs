@@ -45,17 +45,19 @@ impl FrameTimingTracker {
             // Record the actual inter-frame interval
             metrics::histogram!("gui.frame.interval").record(interval);
 
-            // Calculate jitter: deviation from the target frame interval
-            let target_interval = Duration::from_secs_f64(1.0 / target_fps as f64);
-            let jitter_secs = (interval.as_secs_f64() - target_interval.as_secs_f64()).abs();
-            metrics::histogram!("gui.frame.interval.jitter").record(jitter_secs);
+            if target_fps > 0 {
+                // Calculate jitter: deviation from the target frame interval
+                let target_interval = Duration::from_secs_f64(1.0 / target_fps as f64);
+                let jitter_secs = (interval.as_secs_f64() - target_interval.as_secs_f64()).abs();
+                metrics::histogram!("gui.frame.interval.jitter").record(jitter_secs);
 
-            log::trace!(
-                "frame interval={:?} target={:?} jitter={:.3}ms",
-                interval,
-                target_interval,
-                jitter_secs * 1000.0
-            );
+                log::trace!(
+                    "frame interval={:?} target={:?} jitter={:.3}ms",
+                    interval,
+                    target_interval,
+                    jitter_secs * 1000.0
+                );
+            }
         }
 
         self.last_present_time = Some(now);
