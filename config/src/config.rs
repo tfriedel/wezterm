@@ -350,8 +350,8 @@ pub struct Config {
     pub webgpu_preferred_adapter: Option<GpuInfo>,
 
     /// Controls GPU presentation timing.
-    /// - Fifo: Vsync enabled, may add latency (default)
-    /// - Mailbox: Low latency without tearing (if supported)
+    /// - Mailbox: Low latency without tearing (if supported, default)
+    /// - Fifo: Vsync enabled, may add latency
     /// - Immediate: Lowest latency, may tear
     /// - AutoNoVsync: Tries Mailbox, falls back to Immediate
     #[dynamic(default)]

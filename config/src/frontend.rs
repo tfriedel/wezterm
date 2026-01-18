@@ -72,6 +72,6 @@ pub enum WebGpuPresentMode {
 
 impl Default for WebGpuPresentMode {
     fn default() -> Self {
-        Self::Fifo
+        Self::Mailbox
     }
 }

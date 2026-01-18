@@ -15,16 +15,14 @@ use std::time::Instant;
 /// Windows-specific helper for requesting a finer timer resolution
 #[cfg(windows)]
 mod dwm_vsync {
-    use std::sync::OnceLock;
-
-    struct TimerResolutionGuard;
+    pub struct TimerResolutionGuard;
 
     impl TimerResolutionGuard {
-        fn new() -> Self {
+        pub fn new() -> Self {
             unsafe {
                 winapi::um::timeapi::timeBeginPeriod(1);
             }
-            log::debug!("Set Windows timer resolution to 1ms for frame pacing");
+            log::trace!("Set Windows timer resolution to 1ms for frame pacing");
             Self
         }
     }
@@ -34,14 +32,8 @@ mod dwm_vsync {
             unsafe {
                 winapi::um::timeapi::timeEndPeriod(1);
             }
-            log::debug!("Released Windows timer resolution override");
+            log::trace!("Released Windows timer resolution override");
         }
-    }
-
-    static TIMER_RESOLUTION: OnceLock<TimerResolutionGuard> = OnceLock::new();
-
-    pub fn ensure_timer_resolution() {
-        TIMER_RESOLUTION.get_or_init(TimerResolutionGuard::new);
     }
 }
 
@@ -227,7 +219,7 @@ impl crate::TermWindow {
                         // - 60 fps:  16.67ms * 0.4 = 6.67ms
                         // - 120 fps:  8.33ms * 0.4 = 3.33ms
                         // - 240 fps:  4.17ms * 0.4 = 1.67ms
-                        dwm_vsync::ensure_timer_resolution();
+                        let _timer_resolution = dwm_vsync::TimerResolutionGuard::new();
                         let frame_time_ms = 1000.0 / max_fps as f64;
                         let sleep_ms = (frame_time_ms * 0.4).clamp(1.0, 10.0) as u64;
                         std::thread::sleep(Duration::from_millis(sleep_ms));
