@@ -9,7 +9,7 @@ use crate::{
 };
 use anyhow::{bail, Context};
 use async_trait::async_trait;
-use config::{ConfigHandle, ImePreeditRendering, SystemBackdrop, WebGpuPresentMode};
+use config::{ConfigHandle, ImePreeditRendering, SystemBackdrop};
 use lazy_static::lazy_static;
 use promise::Future;
 use raw_window_handle::{
@@ -125,8 +125,8 @@ pub(crate) struct WindowInner {
     appearance: Appearance,
 
     config: ConfigHandle,
-    paint_throttled: bool,
     invalidated: bool,
+    force_immediate_paint: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Ord, PartialOrd)]
@@ -545,8 +545,8 @@ impl Window {
             window_drag_position: None,
             maximize_button_position: None,
             config: config.clone(),
-            paint_throttled: false,
             invalidated: true,
+            force_immediate_paint: false,
         }));
 
         // Careful: `raw` owns a ref to inner, but there is no Drop impl
@@ -614,6 +614,10 @@ fn schedule_show_window(hwnd: HWindow, show: ShowWindowCommand) {
 }
 
 impl WindowInner {
+    fn request_immediate_paint(&mut self) {
+        self.force_immediate_paint = true;
+    }
+
     fn close(&mut self) {
         let hwnd = self.hwnd;
         promise::spawn::spawn(async move {
@@ -1096,7 +1100,10 @@ unsafe fn wm_nccreate(hwnd: HWND, _msg: UINT, _wparam: WPARAM, lparam: LPARAM) -
     let create: &CREATESTRUCTW = &*(lparam as *const CREATESTRUCTW);
     let inner = rc_from_pointer(create.lpCreateParams);
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, create.lpCreateParams as _);
-    inner.borrow_mut().hwnd = HWindow(hwnd);
+    {
+        let mut inner = inner.borrow_mut();
+        inner.hwnd = HWindow(hwnd);
+    }
 
     None
 }
@@ -1568,6 +1575,7 @@ unsafe fn wm_size(hwnd: HWND, _msg: UINT, _wparam: WPARAM, _lparam: LPARAM) -> O
 
     if let Some(inner) = rc_from_hwnd(hwnd) {
         let mut inner = inner.borrow_mut();
+        inner.request_immediate_paint();
         should_paint = inner.check_and_call_resize_if_needed();
         should_pump = inner.in_size_move;
     }
@@ -1612,19 +1620,6 @@ unsafe fn wm_paint(hwnd: HWND, _msg: UINT, _wparam: WPARAM, _lparam: LPARAM) -> 
     let inner = rc_from_hwnd(hwnd)?;
     let mut inner = inner.borrow_mut();
 
-    // For Fifo and Mailbox modes, bypass the timer-based throttle to minimize
-    // input latency. Frame pacing is handled differently for each:
-    // - Fifo: DwmFlush() after present blocks until frame is displayed
-    // - Mailbox: GPU/DWM naturally pace to vsync, we just need to not over-throttle
-    //
-    // Only use timer throttle for Immediate mode where we need explicit rate limiting.
-    let use_timer_throttle = inner.config.webgpu_present_mode == WebGpuPresentMode::Immediate;
-
-    if use_timer_throttle && inner.paint_throttled {
-        inner.invalidated = true;
-        return Some(0);
-    }
-
     let mut ps = PAINTSTRUCT {
         fErase: 0,
         fIncUpdate: 0,
@@ -1643,27 +1638,9 @@ unsafe fn wm_paint(hwnd: HWND, _msg: UINT, _wparam: WPARAM, _lparam: LPARAM) -> 
     EndPaint(hwnd, &mut ps);
 
     inner.invalidated = false;
+    inner.force_immediate_paint = false;
     // Ask the app to repaint in a bit
     inner.events.dispatch(WindowEvent::NeedRepaint);
-
-    // Only use timer-based throttle for Immediate mode
-    // Fifo and Mailbox handle pacing through GPU/DWM vsync
-    if use_timer_throttle {
-        inner.paint_throttled = true;
-        let window_id = inner.hwnd;
-        let max_fps = inner.config.max_fps;
-        promise::spawn::spawn(async move {
-            async_io::Timer::after(std::time::Duration::from_millis(1000 / max_fps as u64)).await;
-            Connection::with_window_inner(window_id, move |inner| {
-                inner.paint_throttled = false;
-                if inner.invalidated {
-                    InvalidateRect(inner.hwnd.0, null(), 0);
-                }
-                Ok(())
-            });
-        })
-        .detach();
-    }
 
     Some(0)
 }
@@ -1770,10 +1747,11 @@ unsafe fn mouse_button(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) ->
         mouse_buttons,
         modifiers,
     };
-    inner
-        .borrow_mut()
-        .events
-        .dispatch(WindowEvent::MouseEvent(event));
+    {
+        let mut inner = inner.borrow_mut();
+        inner.request_immediate_paint();
+        inner.events.dispatch(WindowEvent::MouseEvent(event));
+    }
     Some(0)
 }
 
@@ -1820,10 +1798,11 @@ unsafe fn nc_mouse_button(
         mouse_buttons,
         modifiers,
     };
-    inner
-        .borrow_mut()
-        .events
-        .dispatch(WindowEvent::MouseEvent(event));
+    {
+        let mut inner = inner.borrow_mut();
+        inner.request_immediate_paint();
+        inner.events.dispatch(WindowEvent::MouseEvent(event));
+    }
     Some(0)
 }
 
@@ -1854,6 +1833,7 @@ unsafe fn mouse_move(hwnd: HWND, _msg: UINT, wparam: WPARAM, lparam: LPARAM) -> 
         modifiers,
     };
 
+    inner.request_immediate_paint();
     inner.events.dispatch(WindowEvent::MouseEvent(event));
     Some(0)
 }
@@ -1890,6 +1870,7 @@ unsafe fn nc_mouse_move(hwnd: HWND, _msg: UINT, wparam: WPARAM, lparam: LPARAM) 
         modifiers,
     };
 
+    inner.request_immediate_paint();
     inner.events.dispatch(WindowEvent::MouseEvent(event));
     inner.events.dispatch(WindowEvent::NeedRepaint);
 
@@ -1934,57 +1915,53 @@ unsafe fn mouse_wheel(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) -> 
     };
     let mut position = scaled_delta / WHEEL_DELTA;
     let remainder = scaled_delta % WHEEL_DELTA;
+    let mut inner = inner.borrow_mut();
+    let kind = if msg == WM_MOUSEHWHEEL {
+        if inner.hscroll_remainder.signum() != remainder.signum() {
+            inner.hscroll_remainder = 0;
+        }
+        inner.hscroll_remainder += remainder;
+        position += inner.hscroll_remainder / WHEEL_DELTA;
+        inner.hscroll_remainder %= WHEEL_DELTA;
+        log::trace!(
+            "mouse_hwheel delta={} scaled={} remainder={} pos={}",
+            delta,
+            scaled_delta,
+            inner.hscroll_remainder,
+            position
+        );
+        if position == 0 {
+            return Some(0);
+        }
+        MouseEventKind::HorzWheel(position)
+    } else {
+        if inner.vscroll_remainder.signum() != remainder.signum() {
+            inner.vscroll_remainder = 0;
+        }
+        inner.vscroll_remainder += remainder;
+        position += inner.vscroll_remainder / WHEEL_DELTA;
+        inner.vscroll_remainder %= WHEEL_DELTA;
+        log::trace!(
+            "mouse_wheel delta={} scaled={} remainder={} pos={}",
+            delta,
+            scaled_delta,
+            inner.vscroll_remainder,
+            position
+        );
+        if position == 0 {
+            return Some(0);
+        }
+        MouseEventKind::VertWheel(position)
+    };
     let event = MouseEvent {
-        kind: if msg == WM_MOUSEHWHEEL {
-            let mut inner = inner.borrow_mut();
-            if inner.hscroll_remainder.signum() != remainder.signum() {
-                // Reset remainder when changing scroll direction
-                inner.hscroll_remainder = 0;
-            }
-            inner.hscroll_remainder += remainder;
-            position += inner.hscroll_remainder / WHEEL_DELTA;
-            inner.hscroll_remainder %= WHEEL_DELTA;
-            log::trace!(
-                "mouse_hwheel delta={} scaled={} remainder={} pos={}",
-                delta,
-                scaled_delta,
-                inner.hscroll_remainder,
-                position
-            );
-            if position == 0 {
-                return Some(0);
-            }
-            MouseEventKind::HorzWheel(position)
-        } else {
-            let mut inner = inner.borrow_mut();
-            if inner.vscroll_remainder.signum() != remainder.signum() {
-                // Reset remainder when changing scroll direction
-                inner.vscroll_remainder = 0;
-            }
-            inner.vscroll_remainder += remainder;
-            position += inner.vscroll_remainder / WHEEL_DELTA;
-            inner.vscroll_remainder %= WHEEL_DELTA;
-            log::trace!(
-                "mouse_wheel delta={} scaled={} remainder={} pos={}",
-                delta,
-                scaled_delta,
-                inner.vscroll_remainder,
-                position
-            );
-            if position == 0 {
-                return Some(0);
-            }
-            MouseEventKind::VertWheel(position)
-        },
+        kind,
         coords,
         screen_coords,
         mouse_buttons,
         modifiers,
     };
-    inner
-        .borrow_mut()
-        .events
-        .dispatch(WindowEvent::MouseEvent(event));
+    inner.request_immediate_paint();
+    inner.events.dispatch(WindowEvent::MouseEvent(event));
     Some(0)
 }
 
@@ -2494,6 +2471,7 @@ unsafe fn translate_message(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARA
 unsafe fn key(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
     let inner = rc_from_hwnd(hwnd)?;
     let mut inner = inner.borrow_mut();
+    inner.request_immediate_paint();
     let repeat = (lparam & 0xffff) as u16;
     let scan_code = ((lparam >> 16) & 0xff) as u8;
     let releasing = (lparam & (1 << 31)) != 0;

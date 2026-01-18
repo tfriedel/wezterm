@@ -192,9 +192,20 @@ impl crate::TermWindow {
                     log::trace!("DwmFlush took {:?}", dwm_duration);
                 }
                 WebGpuPresentMode::Mailbox | WebGpuPresentMode::AutoNoVsync => {
-                    // Simple pacing: sleep a fixed period after present.
+                    // Simple pacing: sleep a portion of the frame time after present.
+                    // This approach outperforms async pre-paint throttling because:
+                    // 1. No async executor overhead
+                    // 2. Direct thread sleep is more predictable
+                    // 3. Blocking after present (not before) preserves input responsiveness
+                    //
+                    // Sleep time is 40% of frame time, clamped to 1-10ms:
+                    // - 60 fps:  16.67ms * 0.4 = 6.67ms
+                    // - 120 fps:  8.33ms * 0.4 = 3.33ms
+                    // - 240 fps:  4.17ms * 0.4 = 1.67ms
                     dwm_vsync::ensure_timer_resolution();
-                    std::thread::sleep(Duration::from_millis(6));
+                    let frame_time_ms = 1000.0 / self.config.max_fps as f64;
+                    let sleep_ms = (frame_time_ms * 0.4).clamp(1.0, 10.0) as u64;
+                    std::thread::sleep(Duration::from_millis(sleep_ms));
                 }
                 WebGpuPresentMode::Immediate => {
                     // Immediate mode: no pacing, lowest latency but highest CPU
