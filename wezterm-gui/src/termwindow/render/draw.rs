@@ -195,51 +195,43 @@ impl crate::TermWindow {
         log::trace!("present took {:?}", present_duration);
 
         // Frame pacing for Windows to reduce CPU usage while maintaining low latency.
+        // This uses actual elapsed time measurement rather than arbitrary sleep values.
         #[cfg(windows)]
         {
             use wgpu::PresentMode;
 
             let present_mode = webgpu.config.borrow().present_mode;
-            match present_mode {
-                PresentMode::Fifo | PresentMode::FifoRelaxed => {
-                    // Fifo mode: use DwmFlush for guaranteed vsync sync
-                    // This adds ~1 frame of latency but ensures perfect frame pacing
-                    let dwm_start = Instant::now();
-                    unsafe {
-                        winapi::um::dwmapi::DwmFlush();
-                    }
-                    let dwm_duration = dwm_start.elapsed();
-                    metrics::histogram!("gui.frame.dwm_flush").record(dwm_duration);
-                    log::trace!("DwmFlush took {:?}", dwm_duration);
+            let max_fps = self.config.max_fps;
+
+            // For FIFO mode, use DwmFlush to sync with the compositor
+            if matches!(present_mode, PresentMode::Fifo | PresentMode::FifoRelaxed) {
+                let dwm_start = Instant::now();
+                unsafe {
+                    winapi::um::dwmapi::DwmFlush();
                 }
-                PresentMode::Mailbox => {
-                    let max_fps = self.config.max_fps;
-                    if max_fps == 0 {
-                        // Unlimited FPS: rely on Mailbox/Immediate pacing alone
-                    } else {
-                        // Simple pacing: sleep a portion of the frame time after present.
-                        // This approach outperforms async pre-paint throttling because:
-                        // 1. No async executor overhead
-                        // 2. Direct thread sleep is more predictable
-                        // 3. Blocking after present (not before) preserves input responsiveness
-                        //
-                        // Sleep time is 40% of frame time, clamped to 1-10ms:
-                        // - 60 fps:  16.67ms * 0.4 = 6.67ms
-                        // - 120 fps:  8.33ms * 0.4 = 3.33ms
-                        // - 240 fps:  4.17ms * 0.4 = 1.67ms
-                        dwm_vsync::ensure_timer_resolution();
-                        let frame_time_ms = 1000.0 / max_fps as f64;
-                        let sleep_ms = (frame_time_ms * 0.4).clamp(1.0, 10.0) as u64;
-                        std::thread::sleep(Duration::from_millis(sleep_ms));
-                    }
-                }
-                PresentMode::Immediate => {
-                    // Immediate mode: no pacing, lowest latency but highest CPU
-                }
-                other => {
-                    log::trace!("Unhandled present mode {:?} for pacing; skipping", other);
+                let dwm_duration = dwm_start.elapsed();
+                metrics::histogram!("gui.frame.dwm_flush").record(dwm_duration);
+                log::trace!("DwmFlush took {:?}", dwm_duration);
+            }
+
+            // Honor max_fps for all present modes by sleeping if we're ahead of schedule.
+            // We leave a small buffer before the deadline to avoid oversleeping and
+            // missing vsync (which would delay the frame by a full vsync period).
+            if max_fps > 0 {
+                dwm_vsync::ensure_timer_resolution();
+                let target_frame_time = Duration::from_secs_f64(1.0 / max_fps as f64);
+                // Wake up 2ms early to avoid missing vsync due to sleep inaccuracy.
+                // This is a tradeoff: too small risks missing vsync, too large wastes CPU.
+                let safety_buffer = Duration::from_millis(2);
+                let deadline = target_frame_time.saturating_sub(safety_buffer);
+                let elapsed = self.last_frame_instant.elapsed();
+                if elapsed < deadline {
+                    std::thread::sleep(deadline - elapsed);
                 }
             }
+
+            // Update frame timing for next iteration
+            self.last_frame_instant = Instant::now();
         }
 
         Ok(())

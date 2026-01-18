@@ -458,6 +458,8 @@ pub struct TermWindow {
     num_frames: usize,
     pub fps: f32,
     frame_timing_tracker: FrameTimingTracker,
+    /// Tracks when the last frame was presented, used for max_fps pacing
+    pub last_frame_instant: Instant,
 
     connection_name: String,
 
@@ -686,6 +688,7 @@ impl TermWindow {
             last_frame_duration: Duration::ZERO,
             fps: 0.,
             frame_timing_tracker: FrameTimingTracker::new(),
+            last_frame_instant: Instant::now(),
             config_subscription: None,
             os_parameters: None,
             gl: None,
