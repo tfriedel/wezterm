@@ -8,7 +8,6 @@ use crate::{
     WindowEvent, WindowEventSender, WindowOps, WindowState,
 };
 use anyhow::{bail, Context};
-use async_io::Timer;
 use async_trait::async_trait;
 use config::{ConfigHandle, ImePreeditRendering, SystemBackdrop};
 use lazy_static::lazy_static;
@@ -30,7 +29,6 @@ use std::path::PathBuf;
 use std::ptr::{null, null_mut};
 use std::rc::Rc;
 use std::sync::Mutex;
-use std::time::Duration;
 use wezterm_color_types::LinearRgba;
 use wezterm_font::FontConfiguration;
 use wezterm_input_types::KeyboardLedStatus;
@@ -127,7 +125,6 @@ pub(crate) struct WindowInner {
     appearance: Appearance,
 
     config: ConfigHandle,
-    paint_throttled: bool,
     invalidated: bool,
 }
 
@@ -547,7 +544,6 @@ impl Window {
             window_drag_position: None,
             maximize_button_position: None,
             config: config.clone(),
-            paint_throttled: false,
             invalidated: true,
         }));
 
@@ -1616,7 +1612,6 @@ unsafe fn wm_kill_focus(
 unsafe fn wm_paint(hwnd: HWND, _msg: UINT, _wparam: WPARAM, _lparam: LPARAM) -> Option<LRESULT> {
     let inner = rc_from_hwnd(hwnd)?;
     let mut inner = inner.borrow_mut();
-    let max_fps = inner.config.max_fps;
 
     let mut ps = PAINTSTRUCT {
         fErase: 0,
@@ -1635,33 +1630,9 @@ unsafe fn wm_paint(hwnd: HWND, _msg: UINT, _wparam: WPARAM, _lparam: LPARAM) -> 
     // Do nothing right now
     EndPaint(hwnd, &mut ps);
 
-    if max_fps > 0 && inner.paint_throttled {
-        inner.invalidated = true;
-        return Some(0);
-    }
-
     inner.invalidated = false;
     // Ask the app to repaint in a bit
     inner.events.dispatch(WindowEvent::NeedRepaint);
-
-    if max_fps > 0 {
-        inner.paint_throttled = true;
-        let hwnd = inner.hwnd;
-        promise::spawn::spawn(async move {
-            Timer::after(Duration::from_millis(1000 / max_fps as u64)).await;
-            let _ = Connection::with_window_inner(hwnd, move |inner| {
-                inner.paint_throttled = false;
-                if inner.invalidated {
-                    unsafe {
-                        InvalidateRect(inner.hwnd.0, null(), 0);
-                    }
-                }
-                Ok(())
-            })
-            .await;
-        })
-        .detach();
-    }
 
     Some(0)
 }
