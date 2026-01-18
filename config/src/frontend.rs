@@ -60,9 +60,9 @@ impl Default for WebGpuPowerPreference {
 /// See <https://docs.rs/wgpu/latest/wgpu/enum.PresentMode.html>
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
 pub enum WebGpuPresentMode {
-    /// Vsync enabled, may add latency (default)
+    /// Vsync enabled, may add latency
     Fifo,
-    /// Low latency without tearing, if supported by the display
+    /// Low latency without tearing, if supported by the display (default)
     Mailbox,
     /// Lowest latency, may cause tearing
     Immediate,
