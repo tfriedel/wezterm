@@ -128,8 +128,8 @@ A PowerShell script measures scrolling smoothness across terminals using Intel P
 # Prerequisites
 winget install Intel.PresentMon
 
-# Run benchmark (tests WezTerm, Alacritty, Windows Terminal)
-.\benchmark_terminals.ps1
+# Run benchmark (tests WezTerm by default)
+.\benchmarks\frame_timing.ps1
 
 # Results saved to benchmark_results\<timestamp>\
 ```
@@ -140,8 +140,8 @@ winget install Intel.PresentMon
 - CPU usage during scrolling
 
 **Key files:**
-- `benchmark_terminals.ps1` - Main benchmark script
-- `benchmark_scroll.cmd` - Infinite scroll generator for consistent load
+- `benchmarks/frame_timing.ps1` - Main benchmark script
+- `benchmarks/scroll_generator.cmd` - Infinite scroll generator for consistent load
 
 ### WezTerm Configuration for Testing
 
@@ -162,18 +162,25 @@ config.webgpu_max_frame_latency = 1
 ### Key Rendering Code Locations
 
 - **Frame pacing/vsync**: `wezterm-gui/src/termwindow/render/draw.rs`
-  - `dwm_vsync` module: DWM timing info for vsync alignment
+  - `frame_pacing` module: Precise sleep using high-res timers (Win10+) or hybrid sleep+spin
   - `call_draw_webgpu()`: WebGPU rendering with present mode handling
 - **Present mode config**: `config/src/frontend.rs` (`WebGpuPresentMode` enum)
-- **Timer throttle bypass**: `window/src/os/windows/window.rs`
+- **Frame timing metrics**: `wezterm-gui/src/termwindow/render/paint.rs` (`FrameTimingTracker`)
 
-### Scroll Smoothness Investigation
+### Scroll Smoothness Notes
 
-See `SCROLL_SMOOTHNESS_INVESTIGATION.md` for detailed findings on achieving:
-- 15-18ms latency
-- <1ms frame time stddev
-- <20% CPU usage
+**Goal:** Achieve smooth scrolling with low latency and low CPU usage.
 
-**TL;DR:** wgpu's Fifo mode doesn't block for vsync on Windows (DWM handles composition). Solutions:
-1. `DwmFlush()` after present - smooth but adds latency
-2. Mailbox with frame pacing - sleep after present until near next vsync
+**Key insights:**
+- wgpu's Fifo mode doesn't block for vsync on Windows (DWM handles composition)
+- Mailbox mode provides low latency without tearing
+- Frame pacing uses high-resolution waitable timers on Windows 10 1803+ (no system-wide impact)
+- Older Windows falls back to hybrid sleep+spin with temporary timer resolution elevation
+
+**Recommended config for smooth scrolling:**
+```lua
+config.front_end = "WebGpu"
+config.max_fps = 120
+config.webgpu_present_mode = "Mailbox"
+config.webgpu_max_frame_latency = 1
+```

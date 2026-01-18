@@ -1095,7 +1095,12 @@ impl TermWindow {
             Err(err) => {
                 match err.downcast_ref::<wgpu::SurfaceError>() {
                     Some(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                        log::debug!("Surface lost/outdated, recreating");
                         self.webgpu.as_mut().unwrap().resize(self.dimensions);
+                        // Reset frame timing to avoid recording a spurious interval
+                        // after surface recreation
+                        self.frame_timing_tracker.reset();
+                        self.last_frame_instant = std::time::Instant::now();
                         return self.do_paint_webgpu_impl();
                     }
                     _ => {}

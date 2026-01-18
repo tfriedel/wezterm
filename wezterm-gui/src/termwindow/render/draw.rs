@@ -12,19 +12,32 @@ use config::FreeTypeLoadTarget;
 use std::time::Duration;
 use std::time::Instant;
 
-/// Windows-specific helper for requesting a finer timer resolution
+/// Windows-specific frame pacing utilities.
+///
+/// Provides precise sleeping without permanently affecting the system-wide timer resolution.
+/// Uses high-resolution waitable timers on Windows 10 1803+ (per-process, no system impact),
+/// falling back to a hybrid sleep+spin approach on older systems.
 #[cfg(windows)]
-mod dwm_vsync {
-    use std::sync::OnceLock;
+mod frame_pacing {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
 
+    // Flag for CREATE_WAITABLE_TIMER_HIGH_RESOLUTION (Windows 10 1803+)
+    const CREATE_WAITABLE_TIMER_HIGH_RESOLUTION: u32 = 0x00000002;
+
+    /// Cached result of whether high-resolution timers are available
+    static HIGH_RES_AVAILABLE: AtomicBool = AtomicBool::new(false);
+    static HIGH_RES_CHECKED: AtomicBool = AtomicBool::new(false);
+
+    /// RAII guard for temporary timer resolution elevation.
+    /// Only used as fallback when high-res timers aren't available.
     struct TimerResolutionGuard;
 
     impl TimerResolutionGuard {
-        fn new() -> Self {
+        fn acquire() -> Self {
             unsafe {
                 winapi::um::timeapi::timeBeginPeriod(1);
             }
-            log::debug!("Set Windows timer resolution to 1ms for frame pacing");
             Self
         }
     }
@@ -34,14 +47,185 @@ mod dwm_vsync {
             unsafe {
                 winapi::um::timeapi::timeEndPeriod(1);
             }
-            log::debug!("Released Windows timer resolution override");
         }
     }
 
-    static TIMER_RESOLUTION: OnceLock<TimerResolutionGuard> = OnceLock::new();
+    /// Check if high-resolution waitable timers are supported.
+    /// This is a Windows 10 1803+ feature that allows precise timing
+    /// without affecting the system-wide timer resolution.
+    fn is_high_res_timer_available() -> bool {
+        if HIGH_RES_CHECKED.load(Ordering::Relaxed) {
+            return HIGH_RES_AVAILABLE.load(Ordering::Relaxed);
+        }
 
-    pub fn ensure_timer_resolution() {
-        TIMER_RESOLUTION.get_or_init(TimerResolutionGuard::new);
+        let available = unsafe {
+            // Try to create a high-resolution timer
+            let handle = winapi::um::synchapi::CreateWaitableTimerExW(
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                winapi::um::winnt::TIMER_ALL_ACCESS,
+            );
+
+            if handle.is_null() {
+                false
+            } else {
+                winapi::um::handleapi::CloseHandle(handle);
+                true
+            }
+        };
+
+        HIGH_RES_AVAILABLE.store(available, Ordering::Relaxed);
+        HIGH_RES_CHECKED.store(true, Ordering::Relaxed);
+
+        if available {
+            log::debug!("High-resolution waitable timers available (Windows 10 1803+)");
+        } else {
+            log::debug!("High-resolution timers not available, will use fallback");
+        }
+
+        available
+    }
+
+    /// Sleep using a high-resolution waitable timer.
+    /// Returns true if successful, false if we should fall back.
+    fn sleep_high_res(duration: Duration) -> bool {
+        unsafe {
+            let handle = winapi::um::synchapi::CreateWaitableTimerExW(
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                winapi::um::winnt::TIMER_ALL_ACCESS,
+            );
+
+            if handle.is_null() {
+                return false;
+            }
+
+            // Convert duration to 100-nanosecond intervals (negative = relative time)
+            let due_time = -((duration.as_nanos() / 100) as i64);
+
+            let set_result = winapi::um::synchapi::SetWaitableTimer(
+                handle,
+                &due_time as *const i64 as *const _,
+                0,                    // no period (one-shot)
+                None,                 // no completion routine
+                std::ptr::null_mut(), // no completion arg
+                0,                    // don't resume from suspend
+            );
+
+            if set_result == 0 {
+                winapi::um::handleapi::CloseHandle(handle);
+                return false;
+            }
+
+            // Wait for the timer
+            winapi::um::synchapi::WaitForSingleObject(
+                handle,
+                winapi::um::winbase::INFINITE,
+            );
+
+            winapi::um::handleapi::CloseHandle(handle);
+            true
+        }
+    }
+
+    /// Sleep for the specified duration with high precision.
+    ///
+    /// This function provides precise timing while minimizing system-wide impact:
+    ///
+    /// 1. **Windows 10 1803+**: Uses high-resolution waitable timers, which are
+    ///    per-process and don't affect the global timer interrupt frequency.
+    ///
+    /// 2. **Older Windows**: Falls back to a hybrid approach:
+    ///    - Temporarily elevates timer resolution to 1ms (only during the sleep)
+    ///    - Sleeps for most of the duration
+    ///    - Spin-waits for the final portion for precision
+    ///
+    /// The spin-wait portion is limited to avoid excessive CPU usage.
+    pub fn precise_sleep(duration: Duration) {
+        // Don't bother with very short sleeps
+        if duration < Duration::from_micros(100) {
+            return;
+        }
+
+        // Try high-resolution timer first (best option - no system impact)
+        if is_high_res_timer_available() && sleep_high_res(duration) {
+            return;
+        }
+
+        // Fallback: hybrid sleep + spin approach
+        // This temporarily affects system timer resolution, but only during active sleep
+        let spin_threshold = Duration::from_millis(2);
+        let deadline = Instant::now() + duration;
+
+        if duration > spin_threshold {
+            // Only elevate timer resolution during this sleep call
+            let _guard = TimerResolutionGuard::acquire();
+            let sleep_duration = duration - spin_threshold;
+            std::thread::sleep(sleep_duration);
+        }
+
+        // Spin-wait for the remaining time (precise but CPU-intensive)
+        // Cap spin time to avoid runaway CPU usage if something goes wrong
+        let max_spin = Duration::from_millis(3);
+        let spin_start = Instant::now();
+
+        while Instant::now() < deadline {
+            if spin_start.elapsed() > max_spin {
+                // Something's wrong, bail out to avoid burning CPU forever
+                log::trace!("precise_sleep: spin limit exceeded, breaking");
+                break;
+            }
+            std::hint::spin_loop();
+        }
+    }
+
+    /// Sleep until the target frame time has elapsed since `frame_start`.
+    /// Uses adaptive safety buffer based on refresh rate.
+    ///
+    /// Returns the actual time slept (for metrics).
+    pub fn pace_frame(frame_start: Instant, target_fps: u64) -> Duration {
+        if target_fps == 0 {
+            return Duration::ZERO;
+        }
+
+        let target_frame_time = Duration::from_secs_f64(1.0 / target_fps as f64);
+        let elapsed = frame_start.elapsed();
+
+        if elapsed >= target_frame_time {
+            // Already past deadline, no sleep needed
+            return Duration::ZERO;
+        }
+
+        let remaining = target_frame_time - elapsed;
+
+        // Adaptive safety buffer: 12% of frame time, clamped to reasonable bounds
+        // 60Hz (16.7ms): 2.0ms buffer
+        // 120Hz (8.3ms): 1.0ms buffer
+        // 240Hz (4.2ms): 0.5ms buffer (clamped to minimum)
+        let buffer_ratio = 0.12;
+        let min_buffer = Duration::from_micros(500);
+        let max_buffer = Duration::from_millis(3);
+        let safety_buffer = Duration::from_secs_f64(target_frame_time.as_secs_f64() * buffer_ratio)
+            .clamp(min_buffer, max_buffer);
+
+        let sleep_duration = remaining.saturating_sub(safety_buffer);
+
+        if sleep_duration > Duration::from_micros(100) {
+            let sleep_start = Instant::now();
+            precise_sleep(sleep_duration);
+            let actual_sleep = sleep_start.elapsed();
+            log::trace!(
+                "pace_frame: target={:?}, elapsed={:?}, slept={:?}",
+                target_frame_time,
+                elapsed,
+                actual_sleep
+            );
+            return actual_sleep;
+        }
+
+        Duration::ZERO
     }
 }
 
@@ -195,43 +379,54 @@ impl crate::TermWindow {
         log::trace!("present took {:?}", present_duration);
 
         // Frame pacing for Windows to reduce CPU usage while maintaining low latency.
-        // This uses actual elapsed time measurement rather than arbitrary sleep values.
         #[cfg(windows)]
         {
             use wgpu::PresentMode;
 
+            // Capture frame boundary IMMEDIATELY after present - this is critical
+            // for accurate frame timing. We measure from present-to-present, not
+            // including our own sleep time.
+            let frame_presented_at = Instant::now();
+
             let present_mode = webgpu.config.borrow().present_mode;
             let max_fps = self.config.max_fps;
 
-            // For FIFO mode, use DwmFlush to sync with the compositor
-            if matches!(present_mode, PresentMode::Fifo | PresentMode::FifoRelaxed) {
-                let dwm_start = Instant::now();
-                unsafe {
-                    winapi::um::dwmapi::DwmFlush();
+            // For FIFO mode, use DwmFlush to sync with the compositor.
+            // However, skip it if present() already blocked significantly,
+            // which indicates the driver is handling vsync (varies by vendor).
+            // Note: We only check for Fifo since our config doesn't expose FifoRelaxed.
+            if matches!(present_mode, PresentMode::Fifo) {
+                // If present took >4ms, driver likely already synced with vsync
+                let driver_likely_synced = present_duration > Duration::from_millis(4);
+
+                if !driver_likely_synced {
+                    let dwm_start = Instant::now();
+                    unsafe {
+                        winapi::um::dwmapi::DwmFlush();
+                    }
+                    let dwm_duration = dwm_start.elapsed();
+                    metrics::histogram!("gui.frame.dwm_flush").record(dwm_duration);
+                    log::trace!("DwmFlush took {:?}", dwm_duration);
+                } else {
+                    log::trace!(
+                        "Skipping DwmFlush, present already blocked for {:?}",
+                        present_duration
+                    );
                 }
-                let dwm_duration = dwm_start.elapsed();
-                metrics::histogram!("gui.frame.dwm_flush").record(dwm_duration);
-                log::trace!("DwmFlush took {:?}", dwm_duration);
             }
 
-            // Honor max_fps for all present modes by sleeping if we're ahead of schedule.
-            // We leave a small buffer before the deadline to avoid oversleeping and
-            // missing vsync (which would delay the frame by a full vsync period).
+            // Honor max_fps using precise sleep that minimizes system-wide impact.
+            // Uses high-resolution waitable timers on Windows 10 1803+, falling
+            // back to hybrid sleep+spin on older systems.
             if max_fps > 0 {
-                dwm_vsync::ensure_timer_resolution();
-                let target_frame_time = Duration::from_secs_f64(1.0 / max_fps as f64);
-                // Wake up 2ms early to avoid missing vsync due to sleep inaccuracy.
-                // This is a tradeoff: too small risks missing vsync, too large wastes CPU.
-                let safety_buffer = Duration::from_millis(2);
-                let deadline = target_frame_time.saturating_sub(safety_buffer);
-                let elapsed = self.last_frame_instant.elapsed();
-                if elapsed < deadline {
-                    std::thread::sleep(deadline - elapsed);
+                let sleep_duration = frame_pacing::pace_frame(self.last_frame_instant, max_fps);
+                if sleep_duration > Duration::ZERO {
+                    metrics::histogram!("gui.frame.pacing_sleep").record(sleep_duration);
                 }
             }
 
-            // Update frame timing for next iteration
-            self.last_frame_instant = Instant::now();
+            // Update frame timing reference point for next iteration
+            self.last_frame_instant = frame_presented_at;
         }
 
         Ok(())

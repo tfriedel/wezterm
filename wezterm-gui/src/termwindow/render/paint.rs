@@ -21,6 +21,11 @@ pub struct FrameTimingTracker {
     last_present_time: Option<Instant>,
 }
 
+/// Maximum reasonable frame interval before we consider it an outlier.
+/// If more than 1 second has passed, the window was likely minimized,
+/// the system was asleep, or something else paused rendering.
+const MAX_REASONABLE_FRAME_INTERVAL: Duration = Duration::from_secs(1);
+
 impl Default for FrameTimingTracker {
     fn default() -> Self {
         Self::new()
@@ -34,13 +39,35 @@ impl FrameTimingTracker {
         }
     }
 
+    /// Reset the timing tracker.
+    /// Call this when the window is minimized, hidden, or the surface is recreated
+    /// to avoid recording a spurious large interval on the next frame.
+    pub fn reset(&mut self) {
+        self.last_present_time = None;
+        log::trace!("Frame timing tracker reset");
+    }
+
     /// Record a frame presentation and emit timing metrics.
     /// Call this after each frame is presented to track inter-frame intervals.
+    ///
+    /// Intervals longer than 1 second are considered outliers (window was minimized,
+    /// system slept, etc.) and are not recorded to avoid polluting metrics.
     pub fn record_frame(&mut self, target_fps: u32) {
         let now = Instant::now();
 
         if let Some(last) = self.last_present_time {
             let interval = now.duration_since(last);
+
+            // Skip outliers - these indicate the window was minimized, system slept, etc.
+            // Recording these would pollute our smoothness metrics.
+            if interval > MAX_REASONABLE_FRAME_INTERVAL {
+                log::trace!(
+                    "Skipping frame interval outlier: {:?} (likely window was inactive)",
+                    interval
+                );
+                self.last_present_time = Some(now);
+                return;
+            }
 
             // Record the actual inter-frame interval
             metrics::histogram!("gui.frame.interval").record(interval);

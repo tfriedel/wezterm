@@ -47,9 +47,15 @@ $scrollCommand = "powershell -NoProfile -Command `"1..50000 | ForEach-Object { W
 
 # Terminal configurations
 # Set $EnabledTerminals to control which terminals to test
-$EnabledTerminals = @("WezTerm")  # Options: "WezTerm", "WindowsTerminal", "WindowsTerminalDev", "Alacritty"
+# Options: "WezTerm", "WindowsTerminal", "WindowsTerminalDev", "Alacritty"
+$EnabledTerminals = @("WezTerm")
 
-$scrollScript = "S:\projects\wezterm\benchmark_scroll.cmd"
+# Use script directory for relative paths
+$scriptDir = $PSScriptRoot
+if (-not $scriptDir) { $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path }
+$repoRoot = Split-Path -Parent $scriptDir
+$scrollScript = Join-Path $scriptDir "scroll_generator.cmd"
+$weztermExe = Join-Path $repoRoot "target\release\wezterm-gui.exe"
 
 # Get screen dimensions for consistent window positioning (left half of screen)
 Add-Type -AssemblyName System.Windows.Forms
@@ -63,7 +69,7 @@ $allTerminals = @(
     @{
         Name = "WezTerm"
         Process = "wezterm-gui"
-        Executable = "S:\projects\wezterm\target\release\wezterm-gui.exe"
+        Executable = $weztermExe
         # WezTerm: user's config handles window positioning
         Arguments = @("start", "--cwd", ".", "--", "cmd", "/c", $scrollScript)
     },
