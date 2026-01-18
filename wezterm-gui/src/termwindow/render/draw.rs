@@ -1,6 +1,6 @@
 use crate::colorease::ColorEaseUniform;
-use crate::termwindow::RenderFrame;
 use crate::termwindow::webgpu::ShaderUniform;
+use crate::termwindow::RenderFrame;
 use crate::uniforms::UniformBuilder;
 use ::window::glium;
 use ::window::glium::uniforms::{
@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 #[cfg(windows)]
 mod dwm_vsync {
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     /// Track whether we've set the timer resolution
     static TIMER_RESOLUTION_SET: AtomicBool = AtomicBool::new(false);
@@ -33,84 +33,157 @@ mod dwm_vsync {
         }
     }
 
-    /// Get the time until the next vsync boundary using DWM timing info.
-    /// Returns None if timing info couldn't be retrieved.
-    ///
-    /// This uses DwmGetCompositionTimingInfo to get:
-    /// - qpcVBlank: the QPC timestamp of the last vsync
-    /// - qpcRefreshPeriod: the refresh period in QPC ticks
-    ///
-    /// We calculate when the next vsync will occur and return the duration to wait.
-    pub fn time_until_next_vsync() -> Option<Duration> {
+    /// Query the current refresh period using DwmGetCompositionTimingInfo.
+    pub fn query_refresh_period() -> Option<Duration> {
         use std::mem::MaybeUninit;
         use winapi::shared::minwindef::FALSE;
         use winapi::um::dwmapi::{DwmGetCompositionTimingInfo, DWM_TIMING_INFO};
-        use winapi::um::profileapi::{QueryPerformanceCounter, QueryPerformanceFrequency};
+        use winapi::um::profileapi::QueryPerformanceFrequency;
 
         unsafe {
-            // Get QPC frequency for converting QPC ticks to time
             let mut frequency: i64 = 0;
             if QueryPerformanceFrequency(&mut frequency as *mut i64 as *mut _) == FALSE {
                 return None;
             }
 
-            // Get current QPC time
-            let mut current_qpc: i64 = 0;
-            if QueryPerformanceCounter(&mut current_qpc as *mut i64 as *mut _) == FALSE {
-                return None;
-            }
-
-            // Get DWM timing info
-            // Note: hwnd must be NULL on Windows 8.1+
             let mut timing_info = MaybeUninit::<DWM_TIMING_INFO>::zeroed();
             let timing_ptr = timing_info.as_mut_ptr();
             (*timing_ptr).cbSize = std::mem::size_of::<DWM_TIMING_INFO>() as u32;
 
             let result = DwmGetCompositionTimingInfo(std::ptr::null_mut(), timing_ptr);
             if result != 0 {
-                // HRESULT failure
                 return None;
             }
 
             let timing_info = timing_info.assume_init();
-            let qpc_vblank = timing_info.qpcVBlank as i64;
             let qpc_refresh_period = timing_info.qpcRefreshPeriod as i64;
-
             if qpc_refresh_period <= 0 {
                 return None;
             }
 
-            // Calculate time since last vsync
-            let time_since_vblank = current_qpc - qpc_vblank;
-
-            // Calculate how many periods have elapsed since the recorded vblank
-            let periods_elapsed = time_since_vblank / qpc_refresh_period;
-
-            // Calculate the next vsync time
-            let next_vsync = qpc_vblank + (periods_elapsed + 1) * qpc_refresh_period;
-
-            // Time until next vsync in QPC ticks
-            let ticks_until_vsync = next_vsync - current_qpc;
-
-            if ticks_until_vsync <= 0 {
-                // Already past, present immediately
-                return Some(Duration::ZERO);
-            }
-
-            // Convert QPC ticks to Duration
-            // Duration = ticks * (1 second / frequency)
-            let nanos = (ticks_until_vsync as u128 * 1_000_000_000) / frequency as u128;
+            let nanos = (qpc_refresh_period as u128 * 1_000_000_000) / frequency as u128;
             Some(Duration::from_nanos(nanos as u64))
         }
     }
+}
 
-    /// Sleep with 1ms timer resolution (no spin-wait to avoid CPU burn).
-    /// With timeBeginPeriod(1), Windows sleep is accurate to ~1-2ms.
-    pub fn precise_sleep(duration: Duration) {
-        if duration.is_zero() {
+#[cfg(windows)]
+const DEFAULT_REFRESH_PERIOD: Duration = Duration::from_nanos(16_666_667);
+
+#[cfg(windows)]
+pub struct FramePacer {
+    refresh_period: Duration,
+    last_refresh_query: Instant,
+    last_frame_end: Instant,
+    overshoot_streak: u8,
+}
+
+#[cfg(windows)]
+impl FramePacer {
+    pub fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            refresh_period: DEFAULT_REFRESH_PERIOD,
+            last_refresh_query: now,
+            last_frame_end: now,
+            overshoot_streak: 0,
+        }
+    }
+
+    fn refresh_period_secs(&self) -> f64 {
+        self.refresh_period.as_secs_f64()
+    }
+
+    fn maybe_update_refresh_period(&mut self) {
+        const REFRESH_QUERY_INTERVAL: Duration = Duration::from_secs(1);
+
+        if self.last_refresh_query.elapsed() < REFRESH_QUERY_INTERVAL {
             return;
         }
-        std::thread::sleep(duration);
+        self.last_refresh_query = Instant::now();
+
+        if let Some(new_period) = dwm_vsync::query_refresh_period() {
+            // Ignore obviously bogus values
+            if new_period < Duration::from_millis(2) || new_period > Duration::from_millis(25) {
+                return;
+            }
+
+            let current = self.refresh_period;
+            let diff = if new_period > current {
+                new_period - current
+            } else {
+                current - new_period
+            };
+
+            if diff >= Duration::from_micros(200) {
+                log::debug!(
+                    "FramePacer refresh period update {:?} -> {:?}",
+                    current,
+                    new_period
+                );
+                self.refresh_period = new_period;
+            }
+        }
+    }
+
+    fn clamp_margin(target_secs: f64) -> Duration {
+        // Aim to start rendering slightly before vsync. Keep the margin small on
+        // fast panels but cap it for 60Hz to avoid excessive idle time.
+        let min_margin = 0.0005;
+        let max_margin = 0.006;
+        let desired = (target_secs * 0.2).clamp(min_margin, max_margin);
+        Duration::from_secs_f64(desired)
+    }
+
+    fn clamp_sleep_bounds(target: Duration) -> (f64, f64) {
+        let min_sleep = Duration::from_micros(500);
+        let max_sleep = target
+            .saturating_sub(Duration::from_micros(500))
+            .max(min_sleep);
+        (min_sleep.as_secs_f64(), max_sleep.as_secs_f64())
+    }
+
+    pub fn pace(&mut self, frame_start: Instant, frame_end: Instant) {
+        dwm_vsync::ensure_timer_resolution();
+        self.maybe_update_refresh_period();
+
+        let target = self.refresh_period;
+        let target_secs = self.refresh_period_secs();
+        let frame_render_time = frame_end
+            .checked_duration_since(frame_start)
+            .unwrap_or_default();
+        let frame_interval = frame_end
+            .checked_duration_since(self.last_frame_end)
+            .unwrap_or_default();
+        self.last_frame_end = frame_end;
+
+        let safety_margin = Self::clamp_margin(target_secs);
+        let baseline_sleep = target.saturating_sub(frame_render_time + safety_margin);
+        let baseline_secs = baseline_sleep.as_secs_f64();
+        let error_secs = target_secs - frame_interval.as_secs_f64();
+        let mut sleep_secs = baseline_secs + error_secs * 0.5;
+
+        let (min_sleep, max_sleep) = Self::clamp_sleep_bounds(target);
+        if !sleep_secs.is_finite() {
+            sleep_secs = min_sleep;
+        }
+        sleep_secs = sleep_secs.clamp(min_sleep, max_sleep);
+        let mut sleep_duration = Duration::from_secs_f64(sleep_secs);
+
+        let overshoot_threshold = Duration::from_millis(3);
+        if frame_interval > target + overshoot_threshold {
+            self.overshoot_streak = self.overshoot_streak.saturating_add(1).min(10);
+        } else {
+            self.overshoot_streak = self.overshoot_streak.saturating_sub(1);
+        }
+
+        if self.overshoot_streak >= 4 {
+            sleep_duration = Duration::from_millis(1);
+            self.overshoot_streak = 0;
+        }
+
+        metrics::histogram!("gui.frame.pacer.sleep").record(sleep_duration);
+        std::thread::sleep(sleep_duration);
     }
 }
 
@@ -124,6 +197,9 @@ impl crate::TermWindow {
 
     fn call_draw_webgpu(&mut self) -> anyhow::Result<()> {
         use crate::termwindow::webgpu::WebGpuTexture;
+
+        #[cfg(windows)]
+        let frame_start = Instant::now();
 
         let webgpu = self.webgpu.as_mut().unwrap();
         let render_state = self.render_state.as_ref().unwrap();
@@ -263,18 +339,22 @@ impl crate::TermWindow {
         metrics::histogram!("gui.frame.present_wait").record(present_duration);
         log::trace!("present took {:?}", present_duration);
 
+        #[cfg(windows)]
+        {
+            let frame_end = Instant::now();
+            if matches!(
+                self.config.webgpu_present_mode,
+                WebGpuPresentMode::Mailbox | WebGpuPresentMode::AutoNoVsync
+            ) {
+                self.frame_pacer.pace(frame_start, frame_end);
+            }
+        }
+
         // Frame pacing for Windows to reduce CPU usage while maintaining low latency.
         //
-        // The key insight is WHERE we sleep matters for latency:
-        // - DwmFlush() waits for the CURRENT frame to be displayed → adds latency
-        // - Sleeping here delays starting the NEXT frame → doesn't add latency
-        //
-        // In Mailbox mode without pacing, we render as fast as possible (~1500 fps),
-        // wasting CPU because DWM only picks up one frame per vsync anyway.
-        //
-        // With pacing: after present(), we calculate time until next vsync and sleep
-        // for most of that time, leaving a margin to start rendering the next frame
-        // so it's ready just in time for the following vsync.
+        // Mailbox/AutoNoVsync present modes rely on FramePacer above, which pauses after
+        // present() based on the measured refresh interval. Fifo continues to use DwmFlush
+        // to guarantee vsync synchronization at the cost of one frame of latency.
         #[cfg(windows)]
         {
             match self.config.webgpu_present_mode {
@@ -290,19 +370,7 @@ impl crate::TermWindow {
                     log::trace!("DwmFlush took {:?}", dwm_duration);
                 }
                 WebGpuPresentMode::Mailbox | WebGpuPresentMode::AutoNoVsync => {
-                    // Mailbox mode: sleep after present to limit frame rate and save CPU.
-                    //
-                    // This doesn't add input latency because:
-                    // - Input arrives → paint happens immediately (no throttle)
-                    // - Present completes → we sleep here
-                    // - Next frame starts after sleep expires
-                    //
-                    // Fixed 6ms sleep balances CPU savings vs frame rate:
-                    // - With ~2ms render time, cycle is ~8ms = ~125fps max
-                    // - DWM picks up frames at vsync rate (60/120/144Hz)
-                    // - Extra frames are discarded, but CPU is much lower than no sleep
-                    dwm_vsync::ensure_timer_resolution();
-                    std::thread::sleep(Duration::from_millis(6));
+                    // Mailbox mode pacing handled by FramePacer; nothing additional here.
                 }
                 WebGpuPresentMode::Immediate => {
                     // Immediate mode: no pacing, lowest latency but highest CPU
