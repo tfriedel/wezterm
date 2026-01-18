@@ -20,7 +20,6 @@ use crate::termwindow::background::{
 };
 use crate::termwindow::keyevent::{KeyTableArgs, KeyTableState};
 use crate::termwindow::modal::Modal;
-#[cfg(windows)]
 use crate::termwindow::render::paint::{AllowImage, FrameTimingTracker};
 use crate::termwindow::render::{
     CachedLineState, LineQuadCacheKey, LineQuadCacheValue, LineToEleShapeCacheKey,
