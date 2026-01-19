@@ -42,6 +42,55 @@ mod pacing_constants {
     pub const DRIVER_VSYNC_THRESHOLD: Duration = Duration::from_millis(4);
 }
 
+/// Windows DWM (Desktop Window Manager) state utilities.
+///
+/// Provides cached checks for DWM composition state and rate-limited logging
+/// to avoid spamming logs in RDP or other scenarios where DWM is disabled.
+#[cfg(windows)]
+mod dwm_state {
+    use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+
+    /// DWM composition state: 0=unchecked, 1=enabled, 2=disabled
+    static DWM_ENABLED: AtomicU8 = AtomicU8::new(0);
+
+    /// Whether we've already warned about DwmFlush failures
+    static DWM_FLUSH_WARNED: AtomicBool = AtomicBool::new(false);
+
+    /// Check if DWM composition is enabled.
+    /// Result is cached after first check for performance.
+    pub fn is_composition_enabled() -> bool {
+        match DWM_ENABLED.load(Ordering::Relaxed) {
+            0 => check_and_cache(),
+            1 => true,
+            _ => false,
+        }
+    }
+
+    fn check_and_cache() -> bool {
+        let mut enabled: i32 = 0;
+        let hr = unsafe { winapi::um::dwmapi::DwmIsCompositionEnabled(&mut enabled) };
+        let result = hr >= 0 && enabled != 0;
+        DWM_ENABLED.store(if result { 1 } else { 2 }, Ordering::Relaxed);
+        if !result {
+            log::debug!("DWM composition is disabled (hr=0x{:08X}, enabled={})", hr as u32, enabled);
+        }
+        result
+    }
+
+    /// Log a DwmFlush failure, warning only on first occurrence.
+    /// Subsequent failures are logged at debug level to avoid spam in RDP.
+    pub fn log_dwm_flush_failure(hr: i32) {
+        if !DWM_FLUSH_WARNED.swap(true, Ordering::Relaxed) {
+            log::warn!(
+                "DwmFlush failed: 0x{:08X} (subsequent failures logged at debug level)",
+                hr as u32
+            );
+        } else {
+            log::debug!("DwmFlush failed: 0x{:08X}", hr as u32);
+        }
+    }
+}
+
 /// Cross-platform frame pacing utilities.
 ///
 /// Provides precise sleeping for frame rate limiting. Platform-specific implementations
@@ -144,10 +193,20 @@ mod frame_pacing {
         /// Cached check for high-resolution timer availability (thread-safe, checked once)
         static HIGH_RES_SUPPORT: OnceLock<HighResTimerSupport> = OnceLock::new();
 
-        // Thread-local cached timer handle to avoid creating/destroying handles per-frame
+        // Thread-local cached timer handle to avoid creating/destroying handles per-frame.
+        //
+        // # Thread Safety
+        // This is safe because WezTerm uses a single-threaded message loop for all rendering.
+        // All frame pacing occurs on the main GUI thread. The debug assertion in
+        // `with_cached_timer` verifies this invariant during development.
         thread_local! {
             static CACHED_TIMER: RefCell<Option<TimerHandle>> = const { RefCell::new(None) };
         }
+
+        /// Thread ID that owns the timer handle (for debug assertions).
+        /// Verifies that frame pacing always occurs on the same thread.
+        #[cfg(debug_assertions)]
+        static EXPECTED_THREAD: OnceLock<std::thread::ThreadId> = OnceLock::new();
 
         /// RAII wrapper for a Windows waitable timer handle
         struct TimerHandle {
@@ -253,8 +312,22 @@ mod frame_pacing {
             })
         }
 
-        /// Get or create the thread-local cached timer handle
+        /// Get or create the thread-local cached timer handle.
+        /// Verifies single-thread invariant in debug builds.
         fn with_cached_timer<R>(f: impl FnOnce(&TimerHandle) -> R) -> Option<R> {
+            // Debug assertion: verify we're always called from the same thread.
+            // This catches accidental multi-threaded frame pacing during development.
+            #[cfg(debug_assertions)]
+            {
+                let current = std::thread::current().id();
+                let expected = EXPECTED_THREAD.get_or_init(|| current);
+                debug_assert_eq!(
+                    *expected, current,
+                    "Frame pacing called from unexpected thread! Expected {:?}, got {:?}",
+                    expected, current
+                );
+            }
+
             CACHED_TIMER.with(|cell| {
                 let mut opt = cell.borrow_mut();
 
@@ -291,6 +364,7 @@ mod frame_pacing {
             // Spin-wait for the remaining time (precise but CPU-intensive)
             // Cap spin time to avoid runaway CPU usage if something goes wrong
             let spin_start = Instant::now();
+            let mut iteration_count = 0u32;
 
             while Instant::now() < deadline {
                 if spin_start.elapsed() > MAX_SPIN_TIME {
@@ -298,7 +372,14 @@ mod frame_pacing {
                     log::trace!("precise_sleep: spin limit exceeded, breaking");
                     break;
                 }
-                std::hint::spin_loop();
+                iteration_count = iteration_count.wrapping_add(1);
+                // Yield every 64 iterations to give other threads a chance to run.
+                // This prevents 100% CPU usage while still maintaining precision.
+                if iteration_count & 0x3F == 0 {
+                    std::thread::yield_now();
+                } else {
+                    std::hint::spin_loop();
+                }
             }
         }
     }
@@ -461,6 +542,12 @@ impl crate::TermWindow {
         // including our own sleep time.
         let frame_presented_at = Instant::now();
 
+        // Record frame timing for smoothness diagnostics immediately after present,
+        // BEFORE any pacing sleep. This ensures we measure actual rendering time,
+        // not rendering + sleep time.
+        self.frame_timing_tracker
+            .record_frame(self.config.max_fps);
+
         // Windows-specific vsync handling with DWM
         #[cfg(windows)]
         {
@@ -469,26 +556,26 @@ impl crate::TermWindow {
             let present_mode = webgpu.config.borrow().present_mode;
 
             // For FIFO mode, use DwmFlush to sync with the compositor.
-            // However, skip it if present() already blocked significantly,
-            // which indicates the driver is handling vsync (varies by vendor).
+            // However, skip it if:
+            // 1. DWM composition is disabled (e.g., RDP sessions)
+            // 2. present() already blocked significantly (driver handling vsync)
             if matches!(present_mode, PresentMode::Fifo) {
                 let driver_likely_synced =
                     present_duration > pacing_constants::DRIVER_VSYNC_THRESHOLD;
 
-                if !driver_likely_synced {
+                if !driver_likely_synced && dwm_state::is_composition_enabled() {
                     let dwm_start = Instant::now();
                     let hr = unsafe { winapi::um::dwmapi::DwmFlush() };
                     let dwm_duration = dwm_start.elapsed();
 
                     if hr < 0 {
-                        // DwmFlush failed - log once and continue
-                        // This can happen if DWM is disabled or in some RDP scenarios
-                        log::debug!("DwmFlush failed with HRESULT: 0x{:08X}", hr as u32);
+                        // Log with rate limiting to avoid spam in problematic scenarios
+                        dwm_state::log_dwm_flush_failure(hr);
                     } else {
                         metrics::histogram!("gui.frame.dwm_flush").record(dwm_duration);
                         log::trace!("DwmFlush took {:?}", dwm_duration);
                     }
-                } else {
+                } else if driver_likely_synced {
                     log::trace!(
                         "Skipping DwmFlush, present already blocked for {:?}",
                         present_duration

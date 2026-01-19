@@ -126,6 +126,10 @@ pub(crate) struct WindowInner {
 
     config: ConfigHandle,
     invalidated: bool,
+
+    /// Timestamp of the last NeedRepaint dispatch for coalescing.
+    /// Uses GetTickCount for lightweight timing (no syscall overhead).
+    last_paint_dispatch_tick: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Ord, PartialOrd)]
@@ -545,6 +549,7 @@ impl Window {
             maximize_button_position: None,
             config: config.clone(),
             invalidated: true,
+            last_paint_dispatch_tick: 0,
         }));
 
         // Careful: `raw` owns a ref to inner, but there is no Drop impl
@@ -1630,8 +1635,23 @@ unsafe fn wm_paint(hwnd: HWND, _msg: UINT, _wparam: WPARAM, _lparam: LPARAM) -> 
     // Do nothing right now
     EndPaint(hwnd, &mut ps);
 
+    // Lightweight paint coalescing: if we dispatched a repaint request very recently
+    // (within 500µs), skip dispatching and just mark as invalidated. This prevents
+    // event flooding during rapid WM_PAINT storms while maintaining responsiveness.
+    let current_tick = GetTickCount();
+    let elapsed_ms = current_tick.wrapping_sub(inner.last_paint_dispatch_tick);
+
+    // GetTickCount has ~1ms resolution, so we use 1ms as our minimum threshold.
+    // For sub-millisecond coalescing, we rely on the invalidated flag.
+    if elapsed_ms == 0 && inner.last_paint_dispatch_tick != 0 {
+        // Very recent dispatch (within last tick) - just mark invalidated
+        inner.invalidated = true;
+        return Some(0);
+    }
+
     inner.invalidated = false;
-    // Ask the app to repaint in a bit
+    inner.last_paint_dispatch_tick = current_tick;
+    // Ask the app to repaint
     inner.events.dispatch(WindowEvent::NeedRepaint);
 
     Some(0)

@@ -359,7 +359,10 @@ pub struct Config {
 
     /// Maximum number of frames the GPU can queue before blocking.
     /// Lower values reduce input latency. Default is 2.
-    #[dynamic(default = "default_webgpu_max_frame_latency")]
+    #[dynamic(
+        default = "default_webgpu_max_frame_latency",
+        validate = "validate_webgpu_max_frame_latency"
+    )]
     pub webgpu_max_frame_latency: u32,
 
     #[dynamic(default)]
@@ -1821,6 +1824,23 @@ fn default_max_fps() -> u64 {
 
 fn default_webgpu_max_frame_latency() -> u32 {
     2
+}
+
+const MIN_WEBGPU_MAX_FRAME_LATENCY: u32 = 1;
+const MAX_WEBGPU_MAX_FRAME_LATENCY: u32 = 16;
+
+fn validate_webgpu_max_frame_latency(value: &u32) -> Result<(), String> {
+    if *value < MIN_WEBGPU_MAX_FRAME_LATENCY {
+        return Err(format!(
+            "Illegal value {value} for webgpu_max_frame_latency; it must be >= {MIN_WEBGPU_MAX_FRAME_LATENCY}"
+        ));
+    }
+    if *value > MAX_WEBGPU_MAX_FRAME_LATENCY {
+        return Err(format!(
+            "Illegal value {value} for webgpu_max_frame_latency; it must be <= {MAX_WEBGPU_MAX_FRAME_LATENCY}"
+        ));
+    }
+    Ok(())
 }
 
 fn default_tiling_desktop_environments() -> Vec<String> {

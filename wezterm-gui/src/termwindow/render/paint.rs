@@ -188,10 +188,6 @@ impl crate::TermWindow {
         self.call_draw(frame).ok();
         self.last_frame_duration = start.elapsed();
 
-        // Record frame timing for smoothness diagnostics
-        self.frame_timing_tracker
-            .record_frame(self.config.max_fps);
-
         log::debug!(
             "paint_impl elapsed={:?}, fps={}",
             self.last_frame_duration,
