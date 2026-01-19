@@ -2,7 +2,7 @@
 tags:
   - gpu
 ---
-# `webgpu_present_mode = "Mailbox"`
+# `webgpu_present_mode = "Fifo"`
 
 {{since('nightly')}}
 
@@ -12,8 +12,8 @@ This option is only applicable when you have configured `front_end = "WebGpu"`.
 
 The possible values are:
 
-* `"Mailbox"` - Low latency without tearing. The GPU renders frames as fast as possible and the most recent complete frame is presented at vsync. This is the default because it typically offers lower latency than Fifo without tearing (when supported by the driver/display).
-* `"Fifo"` - Vsync enabled. Frames are presented in order, synchronized with the display refresh rate. Provides smooth visuals with no tearing, but may add input latency (typically 1-2 frames).
+* `"Fifo"` - Vsync enabled (default). Frames are presented in order, synchronized with the display refresh rate. Provides smooth visuals with no tearing and maximum compatibility across all systems. May add input latency (typically 1-2 frames).
+* `"Mailbox"` - Low latency without tearing. The GPU renders frames as fast as possible and the most recent complete frame is presented at vsync. Offers lower latency than Fifo without tearing, when supported by the driver/display.
 * `"Immediate"` - Lowest latency. Frames are presented immediately without waiting for vsync. This provides the lowest possible input latency but may cause screen tearing.
 * `"AutoNoVsync"` - Automatically selects the best low-latency mode. Tries Mailbox first, falls back to Immediate if Mailbox is not supported, and finally falls back to Fifo.
 

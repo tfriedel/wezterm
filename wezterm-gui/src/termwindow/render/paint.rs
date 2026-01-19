@@ -52,7 +52,7 @@ impl FrameTimingTracker {
     ///
     /// Intervals longer than 1 second are considered outliers (window was minimized,
     /// system slept, etc.) and are not recorded to avoid polluting metrics.
-    pub fn record_frame(&mut self, target_fps: u32) {
+    pub fn record_frame(&mut self, target_fps: u64) {
         let now = Instant::now();
 
         if let Some(last) = self.last_present_time {
@@ -74,7 +74,9 @@ impl FrameTimingTracker {
 
             if target_fps > 0 {
                 // Calculate jitter: deviation from the target frame interval
-                let target_interval = Duration::from_secs_f64(1.0 / target_fps as f64);
+                // Cap FPS to prevent division by very large numbers
+                let capped_fps = target_fps.min(10000);
+                let target_interval = Duration::from_secs_f64(1.0 / capped_fps as f64);
                 let jitter_secs = (interval.as_secs_f64() - target_interval.as_secs_f64()).abs();
                 metrics::histogram!("gui.frame.interval.jitter").record(jitter_secs);
 
@@ -188,7 +190,7 @@ impl crate::TermWindow {
 
         // Record frame timing for smoothness diagnostics
         self.frame_timing_tracker
-            .record_frame(self.config.max_fps as u32);
+            .record_frame(self.config.max_fps);
 
         log::debug!(
             "paint_impl elapsed={:?}, fps={}",

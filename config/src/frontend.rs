@@ -60,9 +60,9 @@ impl Default for WebGpuPowerPreference {
 /// See <https://docs.rs/wgpu/latest/wgpu/enum.PresentMode.html>
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
 pub enum WebGpuPresentMode {
-    /// Vsync enabled, may add latency
+    /// Vsync enabled, guaranteed to work on all systems (default)
     Fifo,
-    /// Low latency without tearing, if supported by the display (default)
+    /// Low latency without tearing, if supported by the display
     Mailbox,
     /// Lowest latency, may cause tearing
     Immediate,
@@ -72,6 +72,8 @@ pub enum WebGpuPresentMode {
 
 impl Default for WebGpuPresentMode {
     fn default() -> Self {
-        Self::Mailbox
+        // Default to Fifo (vsync) for maximum compatibility.
+        // Users who want lower latency can explicitly set Mailbox or AutoNoVsync.
+        Self::Fifo
     }
 }
