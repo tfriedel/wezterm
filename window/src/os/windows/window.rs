@@ -125,8 +125,11 @@ pub(crate) struct WindowInner {
     appearance: Appearance,
 
     config: ConfigHandle,
-    paint_throttled: bool,
     invalidated: bool,
+
+    /// Timestamp of the last NeedRepaint dispatch for coalescing.
+    /// Uses GetTickCount for lightweight timing (no syscall overhead).
+    last_paint_dispatch_tick: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Ord, PartialOrd)]
@@ -545,8 +548,8 @@ impl Window {
             window_drag_position: None,
             maximize_button_position: None,
             config: config.clone(),
-            paint_throttled: false,
             invalidated: true,
+            last_paint_dispatch_tick: 0,
         }));
 
         // Careful: `raw` owns a ref to inner, but there is no Drop impl
@@ -1096,7 +1099,10 @@ unsafe fn wm_nccreate(hwnd: HWND, _msg: UINT, _wparam: WPARAM, lparam: LPARAM) -
     let create: &CREATESTRUCTW = &*(lparam as *const CREATESTRUCTW);
     let inner = rc_from_pointer(create.lpCreateParams);
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, create.lpCreateParams as _);
-    inner.borrow_mut().hwnd = HWindow(hwnd);
+    {
+        let mut inner = inner.borrow_mut();
+        inner.hwnd = HWindow(hwnd);
+    }
 
     None
 }
@@ -1612,11 +1618,6 @@ unsafe fn wm_paint(hwnd: HWND, _msg: UINT, _wparam: WPARAM, _lparam: LPARAM) -> 
     let inner = rc_from_hwnd(hwnd)?;
     let mut inner = inner.borrow_mut();
 
-    if inner.paint_throttled {
-        inner.invalidated = true;
-        return Some(0);
-    }
-
     let mut ps = PAINTSTRUCT {
         fErase: 0,
         fIncUpdate: 0,
@@ -1634,24 +1635,24 @@ unsafe fn wm_paint(hwnd: HWND, _msg: UINT, _wparam: WPARAM, _lparam: LPARAM) -> 
     // Do nothing right now
     EndPaint(hwnd, &mut ps);
 
-    inner.invalidated = false;
-    // Ask the app to repaint in a bit
-    inner.events.dispatch(WindowEvent::NeedRepaint);
+    // Lightweight paint coalescing: if we dispatched a repaint request very recently
+    // (within 500µs), skip dispatching and just mark as invalidated. This prevents
+    // event flooding during rapid WM_PAINT storms while maintaining responsiveness.
+    let current_tick = GetTickCount();
+    let elapsed_ms = current_tick.wrapping_sub(inner.last_paint_dispatch_tick);
 
-    inner.paint_throttled = true;
-    let window_id = inner.hwnd;
-    let max_fps = inner.config.max_fps;
-    promise::spawn::spawn(async move {
-        async_io::Timer::after(std::time::Duration::from_millis(1000 / max_fps as u64)).await;
-        Connection::with_window_inner(window_id, move |inner| {
-            inner.paint_throttled = false;
-            if inner.invalidated {
-                InvalidateRect(inner.hwnd.0, null(), 0);
-            }
-            Ok(())
-        });
-    })
-    .detach();
+    // GetTickCount has ~1ms resolution, so we use 1ms as our minimum threshold.
+    // For sub-millisecond coalescing, we rely on the invalidated flag.
+    if elapsed_ms == 0 && inner.last_paint_dispatch_tick != 0 {
+        // Very recent dispatch (within last tick) - just mark invalidated
+        inner.invalidated = true;
+        return Some(0);
+    }
+
+    inner.invalidated = false;
+    inner.last_paint_dispatch_tick = current_tick;
+    // Ask the app to repaint
+    inner.events.dispatch(WindowEvent::NeedRepaint);
 
     Some(0)
 }
@@ -1758,10 +1759,10 @@ unsafe fn mouse_button(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) ->
         mouse_buttons,
         modifiers,
     };
-    inner
-        .borrow_mut()
-        .events
-        .dispatch(WindowEvent::MouseEvent(event));
+    {
+        let mut inner = inner.borrow_mut();
+        inner.events.dispatch(WindowEvent::MouseEvent(event));
+    }
     Some(0)
 }
 
@@ -1808,10 +1809,10 @@ unsafe fn nc_mouse_button(
         mouse_buttons,
         modifiers,
     };
-    inner
-        .borrow_mut()
-        .events
-        .dispatch(WindowEvent::MouseEvent(event));
+    {
+        let mut inner = inner.borrow_mut();
+        inner.events.dispatch(WindowEvent::MouseEvent(event));
+    }
     Some(0)
 }
 
@@ -1922,57 +1923,52 @@ unsafe fn mouse_wheel(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) -> 
     };
     let mut position = scaled_delta / WHEEL_DELTA;
     let remainder = scaled_delta % WHEEL_DELTA;
+    let mut inner = inner.borrow_mut();
+    let kind = if msg == WM_MOUSEHWHEEL {
+        if inner.hscroll_remainder.signum() != remainder.signum() {
+            inner.hscroll_remainder = 0;
+        }
+        inner.hscroll_remainder += remainder;
+        position += inner.hscroll_remainder / WHEEL_DELTA;
+        inner.hscroll_remainder %= WHEEL_DELTA;
+        log::trace!(
+            "mouse_hwheel delta={} scaled={} remainder={} pos={}",
+            delta,
+            scaled_delta,
+            inner.hscroll_remainder,
+            position
+        );
+        if position == 0 {
+            return Some(0);
+        }
+        MouseEventKind::HorzWheel(position)
+    } else {
+        if inner.vscroll_remainder.signum() != remainder.signum() {
+            inner.vscroll_remainder = 0;
+        }
+        inner.vscroll_remainder += remainder;
+        position += inner.vscroll_remainder / WHEEL_DELTA;
+        inner.vscroll_remainder %= WHEEL_DELTA;
+        log::trace!(
+            "mouse_wheel delta={} scaled={} remainder={} pos={}",
+            delta,
+            scaled_delta,
+            inner.vscroll_remainder,
+            position
+        );
+        if position == 0 {
+            return Some(0);
+        }
+        MouseEventKind::VertWheel(position)
+    };
     let event = MouseEvent {
-        kind: if msg == WM_MOUSEHWHEEL {
-            let mut inner = inner.borrow_mut();
-            if inner.hscroll_remainder.signum() != remainder.signum() {
-                // Reset remainder when changing scroll direction
-                inner.hscroll_remainder = 0;
-            }
-            inner.hscroll_remainder += remainder;
-            position += inner.hscroll_remainder / WHEEL_DELTA;
-            inner.hscroll_remainder %= WHEEL_DELTA;
-            log::trace!(
-                "mouse_hwheel delta={} scaled={} remainder={} pos={}",
-                delta,
-                scaled_delta,
-                inner.hscroll_remainder,
-                position
-            );
-            if position == 0 {
-                return Some(0);
-            }
-            MouseEventKind::HorzWheel(position)
-        } else {
-            let mut inner = inner.borrow_mut();
-            if inner.vscroll_remainder.signum() != remainder.signum() {
-                // Reset remainder when changing scroll direction
-                inner.vscroll_remainder = 0;
-            }
-            inner.vscroll_remainder += remainder;
-            position += inner.vscroll_remainder / WHEEL_DELTA;
-            inner.vscroll_remainder %= WHEEL_DELTA;
-            log::trace!(
-                "mouse_wheel delta={} scaled={} remainder={} pos={}",
-                delta,
-                scaled_delta,
-                inner.vscroll_remainder,
-                position
-            );
-            if position == 0 {
-                return Some(0);
-            }
-            MouseEventKind::VertWheel(position)
-        },
+        kind,
         coords,
         screen_coords,
         mouse_buttons,
         modifiers,
     };
-    inner
-        .borrow_mut()
-        .events
-        .dispatch(WindowEvent::MouseEvent(event));
+    inner.events.dispatch(WindowEvent::MouseEvent(event));
     Some(0)
 }
 

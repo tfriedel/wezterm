@@ -20,7 +20,7 @@ use crate::termwindow::background::{
 };
 use crate::termwindow::keyevent::{KeyTableArgs, KeyTableState};
 use crate::termwindow::modal::Modal;
-use crate::termwindow::render::paint::AllowImage;
+use crate::termwindow::render::paint::{AllowImage, FrameTimingTracker};
 use crate::termwindow::render::{
     CachedLineState, LineQuadCacheKey, LineQuadCacheValue, LineToEleShapeCacheKey,
     LineToElementShapeItem,
@@ -457,6 +457,9 @@ pub struct TermWindow {
     last_fps_check_time: Instant,
     num_frames: usize,
     pub fps: f32,
+    frame_timing_tracker: FrameTimingTracker,
+    /// Tracks when the last frame was presented, used for max_fps pacing
+    pub last_frame_instant: Instant,
 
     connection_name: String,
 
@@ -684,6 +687,8 @@ impl TermWindow {
             num_frames: 0,
             last_frame_duration: Duration::ZERO,
             fps: 0.,
+            frame_timing_tracker: FrameTimingTracker::new(),
+            last_frame_instant: Instant::now(),
             config_subscription: None,
             os_parameters: None,
             gl: None,
@@ -1090,6 +1095,12 @@ impl TermWindow {
             Err(err) => {
                 match err.downcast_ref::<wgpu::SurfaceError>() {
                     Some(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                        log::debug!("Surface lost/outdated, recreating");
+                        // Reset frame timing BEFORE resize to avoid recording a spurious
+                        // interval during surface recreation - this prevents any timing
+                        // operations from reading stale state during the resize
+                        self.frame_timing_tracker.reset();
+                        self.last_frame_instant = std::time::Instant::now();
                         self.webgpu.as_mut().unwrap().resize(self.dimensions);
                         return self.do_paint_webgpu_impl();
                     }

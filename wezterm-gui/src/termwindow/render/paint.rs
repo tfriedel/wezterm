@@ -13,6 +13,86 @@ pub enum AllowImage {
     No,
 }
 
+/// Tracks frame timing for smoothness diagnostics.
+/// Records inter-frame intervals and jitter to help diagnose stuttering.
+#[derive(Debug)]
+pub struct FrameTimingTracker {
+    /// When the last frame was presented
+    last_present_time: Option<Instant>,
+}
+
+/// Maximum reasonable frame interval before we consider it an outlier.
+/// If more than 1 second has passed, the window was likely minimized,
+/// the system was asleep, or something else paused rendering.
+const MAX_REASONABLE_FRAME_INTERVAL: Duration = Duration::from_secs(1);
+
+impl Default for FrameTimingTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FrameTimingTracker {
+    pub fn new() -> Self {
+        Self {
+            last_present_time: None,
+        }
+    }
+
+    /// Reset the timing tracker.
+    /// Call this when the window is minimized, hidden, or the surface is recreated
+    /// to avoid recording a spurious large interval on the next frame.
+    pub fn reset(&mut self) {
+        self.last_present_time = None;
+        log::trace!("Frame timing tracker reset");
+    }
+
+    /// Record a frame presentation and emit timing metrics.
+    /// Call this after each frame is presented to track inter-frame intervals.
+    ///
+    /// Intervals longer than 1 second are considered outliers (window was minimized,
+    /// system slept, etc.) and are not recorded to avoid polluting metrics.
+    pub fn record_frame(&mut self, target_fps: u64) {
+        let now = Instant::now();
+
+        if let Some(last) = self.last_present_time {
+            let interval = now.duration_since(last);
+
+            // Skip outliers - these indicate the window was minimized, system slept, etc.
+            // Recording these would pollute our smoothness metrics.
+            if interval > MAX_REASONABLE_FRAME_INTERVAL {
+                log::trace!(
+                    "Skipping frame interval outlier: {:?} (likely window was inactive)",
+                    interval
+                );
+                self.last_present_time = Some(now);
+                return;
+            }
+
+            // Record the actual inter-frame interval
+            metrics::histogram!("gui.frame.interval").record(interval);
+
+            if target_fps > 0 {
+                // Calculate jitter: deviation from the target frame interval
+                // Cap FPS to prevent division by very large numbers
+                let capped_fps = target_fps.min(10000);
+                let target_interval = Duration::from_secs_f64(1.0 / capped_fps as f64);
+                let jitter_secs = (interval.as_secs_f64() - target_interval.as_secs_f64()).abs();
+                metrics::histogram!("gui.frame.interval.jitter").record(jitter_secs);
+
+                log::trace!(
+                    "frame interval={:?} target={:?} jitter={:.3}ms",
+                    interval,
+                    target_interval,
+                    jitter_secs * 1000.0
+                );
+            }
+        }
+
+        self.last_present_time = Some(now);
+    }
+}
+
 impl crate::TermWindow {
     pub fn paint_impl(&mut self, frame: &mut RenderFrame) {
         self.num_frames += 1;
@@ -107,6 +187,7 @@ impl crate::TermWindow {
 
         self.call_draw(frame).ok();
         self.last_frame_duration = start.elapsed();
+
         log::debug!(
             "paint_impl elapsed={:?}, fps={}",
             self.last_frame_duration,

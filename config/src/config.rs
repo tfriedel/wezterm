@@ -24,8 +24,8 @@ use crate::{
     default_config_with_overrides_applied, default_one_point_oh, default_one_point_oh_f64,
     default_true, default_win32_acrylic_accent_color, CellWidth, GpuInfo,
     IntegratedTitleButtonColor, KeyMapPreference, LoadedConfig, MouseEventTriggerMods, RgbaColor,
-    SerialDomain, SystemBackdrop, WebGpuPowerPreference, CONFIG_DIRS, CONFIG_FILE_OVERRIDE,
-    CONFIG_OVERRIDES, CONFIG_SKIP, HOME_DIR,
+    SerialDomain, SystemBackdrop, WebGpuPowerPreference, WebGpuPresentMode, CONFIG_DIRS,
+    CONFIG_FILE_OVERRIDE, CONFIG_OVERRIDES, CONFIG_SKIP, HOME_DIR,
 };
 use anyhow::Context;
 use luahelper::impl_lua_conversion_dynamic;
@@ -348,6 +348,22 @@ pub struct Config {
 
     #[dynamic(default)]
     pub webgpu_preferred_adapter: Option<GpuInfo>,
+
+    /// Controls GPU presentation timing.
+    /// - Mailbox: Low latency without tearing (if supported, default)
+    /// - Fifo: Vsync enabled, may add latency
+    /// - Immediate: Lowest latency, may tear
+    /// - AutoNoVsync: Tries Mailbox, falls back to Immediate
+    #[dynamic(default)]
+    pub webgpu_present_mode: WebGpuPresentMode,
+
+    /// Maximum number of frames the GPU can queue before blocking.
+    /// Lower values reduce input latency. Default is 2.
+    #[dynamic(
+        default = "default_webgpu_max_frame_latency",
+        validate = "validate_webgpu_max_frame_latency"
+    )]
+    pub webgpu_max_frame_latency: u32,
 
     #[dynamic(default)]
     pub wsl_domains: Option<Vec<WslDomain>>,
@@ -1804,6 +1820,27 @@ fn default_anim_fps() -> u8 {
 
 fn default_max_fps() -> u64 {
     60
+}
+
+fn default_webgpu_max_frame_latency() -> u32 {
+    2
+}
+
+const MIN_WEBGPU_MAX_FRAME_LATENCY: u32 = 1;
+const MAX_WEBGPU_MAX_FRAME_LATENCY: u32 = 16;
+
+fn validate_webgpu_max_frame_latency(value: &u32) -> Result<(), String> {
+    if *value < MIN_WEBGPU_MAX_FRAME_LATENCY {
+        return Err(format!(
+            "Illegal value {value} for webgpu_max_frame_latency; it must be >= {MIN_WEBGPU_MAX_FRAME_LATENCY}"
+        ));
+    }
+    if *value > MAX_WEBGPU_MAX_FRAME_LATENCY {
+        return Err(format!(
+            "Illegal value {value} for webgpu_max_frame_latency; it must be <= {MAX_WEBGPU_MAX_FRAME_LATENCY}"
+        ));
+    }
+    Ok(())
 }
 
 fn default_tiling_desktop_environments() -> Vec<String> {
